@@ -102,7 +102,11 @@ def main():
     split_idx = int(len(df) * (1 - args.holdout_pct))
     df_holdout = df.iloc[split_idx:].copy()
 
-    X_holdout = df_holdout[list(FEATURE_COLUMNS)].values
+    # Use the model's feature columns (may be a pruned subset)
+    model_feature_columns = training_metadata.get(
+        "feature_columns", list(FEATURE_COLUMNS)
+    )
+    X_holdout = df_holdout[model_feature_columns].values
     y_holdout = df_holdout[TARGET_COLUMN].values
 
     print(f"[*] Holdout set: {len(df_holdout):,} samples (last {args.holdout_pct*100:.0f}%)")

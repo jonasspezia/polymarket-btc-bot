@@ -408,7 +408,20 @@ class TradingEngine:
             logger.error(
                 "Model loading failed — ensure you've run the training pipeline first"
             )
-        return success
+            return False
+
+        # Re-initialize pipeline with the model's actual feature columns
+        # (the model may have been trained on a pruned feature subset)
+        model_features = self._model.metadata.get("feature_columns")
+        if model_features:
+            self._pipeline = FeaturePipeline(
+                self._state, model_feature_columns=model_features
+            )
+            logger.info(
+                "Pipeline configured for %d model features", len(model_features)
+            )
+
+        return True
 
     def _build_runtime_summary(self) -> dict:
         """Return a compact end-of-run summary for audit manifests."""

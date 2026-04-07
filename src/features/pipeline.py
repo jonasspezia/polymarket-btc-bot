@@ -26,14 +26,15 @@ class FeaturePipeline:
     Computes the real-time feature vector from the rolling trade state.
     """
 
-    def __init__(self, state: RollingState):
+    def __init__(self, state: RollingState, model_feature_columns: list[str] = None):
         self._state = state
-        self._feature_count = len(FEATURE_COLUMNS)
+        self._model_feature_columns = model_feature_columns or list(FEATURE_COLUMNS)
+        self._feature_count = len(self._model_feature_columns)
         self._historical_bars = pd.DataFrame(columns=BAR_INPUT_COLUMNS)
 
     @property
     def feature_names(self) -> list[str]:
-        return list(FEATURE_COLUMNS)
+        return list(self._model_feature_columns)
 
     @property
     def feature_count(self) -> int:
@@ -91,7 +92,7 @@ class FeaturePipeline:
                 return None
 
             latest = feature_frame.iloc[-1]
-            features = latest[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float64)
+            features = latest[self._model_feature_columns].to_numpy(dtype=np.float64)
             if not np.all(np.isfinite(features)):
                 return None
 
