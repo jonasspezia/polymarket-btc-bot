@@ -66,11 +66,14 @@ def test_position_manager_triggers_stop_loss_in_read_only_mode():
 
 def test_position_manager_scales_out_on_take_profit():
     client = MagicMock()
-    client.get_best_bid_ask.return_value = (0.33, 0.34)
+    # New TP formula: TP = entry + (1-entry)*multiple
+    # entry=0.11, multiple=0.3 → TP = 0.11 + 0.89*0.3 = 0.377
+    # Set bid=0.38 to trigger TP
+    client.get_best_bid_ask.return_value = (0.38, 0.39)
     manager = PositionManager(
         client,
         read_only_mode=True,
-        take_profit_multiple=3.0,
+        take_profit_multiple=0.3,
         take_profit_fraction=0.5,
     )
     end_date = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

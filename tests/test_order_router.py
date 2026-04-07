@@ -280,7 +280,9 @@ class TestOrderRouter:
         second = router.evaluate_and_trade(0.55, market_info)
 
         assert first is not None
-        assert second is None
+        assert second is not None
+        assert second.success is False
+        assert second.error == "duplicate_signal_suppressed"
         assert router.duplicate_signals_suppressed == 1
         assert mock_client.place_post_only_gtd.call_count == 1
 
