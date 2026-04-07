@@ -119,6 +119,10 @@ class MarketProbabilityEstimator:
 
         - momentum: gently reinforce recent directional drift
         - mean_reversion: gently fade recent directional drift
+
+        Bug 4 fix: reduced multiplier from 0.25 to 0.10 to avoid
+        double-counting the model's own momentum features (momentum_1m
+        through momentum_10m already capture recent drift).
         """
         latest_ts = state.latest_timestamp_ms
         if latest_ts <= 0:
@@ -133,9 +137,11 @@ class MarketProbabilityEstimator:
         recent_scale = max(self._estimate_recent_sigma(state), self._min_sigma)
         recent_z = max(min(recent_return / recent_scale, 2.0), -2.0)
 
+        bias_strength = 0.10  # Reduced from 0.25 to avoid double-counting
+
         if self._strategy_style == "mean_reversion":
-            return directional_z - (0.25 * recent_z)
-        return directional_z + (0.25 * recent_z)
+            return directional_z - (bias_strength * recent_z)
+        return directional_z + (bias_strength * recent_z)
 
     def _estimate_recent_sigma(self, state: RollingState) -> float:
         recent_trades = state.get_window_by_time(60)

@@ -6,6 +6,7 @@ fast prediction.
 
 import logging
 import os
+import pickle
 from typing import Any, Optional
 
 import lightgbm as lgb
@@ -30,6 +31,7 @@ class ModelInference:
     def __init__(self, model_path: Optional[str] = None):
         self._model_path = model_path or PATHS.model_path
         self._model: Optional[lgb.Booster] = None
+        self._calibrator = None  # Isotonic calibrator (Improvement 3)
         self._prediction_count = 0
         self._metadata: dict[str, Any] = {}
         self._target_horizon_minutes = DEFAULT_TARGET_HORIZON_MINUTES
@@ -69,12 +71,38 @@ class ModelInference:
             )
             n_features = self._model.num_feature()
             n_trees = self._model.num_trees()
+
+            # Improvement 3: Load isotonic calibrator if available
+            calibrator_path = os.path.join(
+                os.path.dirname(self._model_path), "calibrator.pkl"
+            )
+            if os.path.exists(calibrator_path):
+                try:
+                    with open(calibrator_path, "rb") as f:
+                        self._calibrator = pickle.load(f)
+                    logger.info(
+                        "Isotonic calibrator loaded | path=%s", calibrator_path
+                    )
+                except Exception as cal_err:
+                    logger.warning(
+                        "Failed to load calibrator, using raw probabilities: %s",
+                        cal_err,
+                    )
+                    self._calibrator = None
+            else:
+                logger.info(
+                    "No calibrator found at %s — using raw model probabilities",
+                    calibrator_path,
+                )
+
             logger.info(
-                "Model loaded | path=%s features=%d trees=%d target_horizon=%dm",
+                "Model loaded | path=%s features=%d trees=%d target_horizon=%dm "
+                "calibrated=%s",
                 self._model_path,
                 n_features,
                 n_trees,
                 self._target_horizon_minutes,
+                self._calibrator is not None,
             )
             return True
         except Exception as e:
@@ -105,6 +133,13 @@ class ModelInference:
 
             # proba is array of shape (1,) for binary classification
             p = float(proba[0])
+
+            # Improvement 3: Apply isotonic calibration if available
+            if self._calibrator is not None:
+                try:
+                    p = float(self._calibrator.predict([p])[0])
+                except Exception:
+                    pass  # Fall back to raw probability
 
             if self._prediction_count % 100 == 0:
                 logger.debug(

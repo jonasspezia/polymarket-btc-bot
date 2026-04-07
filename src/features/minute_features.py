@@ -65,7 +65,7 @@ def compute_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         d=FEATURES.fracdiff_d,
     )
 
-    df["vol_1m"] = rolling_volatility_fast(df["log_return"], window=1)
+    df["vol_1m"] = rolling_volatility_fast(df["log_return"], window=5)  # Bug 3 fix: was window=1 (always 0)
     df["vol_5m"] = rolling_volatility_fast(df["log_return"], window=5)
     df["vol_30m"] = rolling_volatility_fast(df["log_return"], window=30)
     df["vol_60m"] = rolling_volatility_fast(df["log_return"], window=60)
@@ -93,6 +93,14 @@ def compute_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     df["trades_intensity"] = (
         df["trades_count"]
         / df["trades_count"].rolling(window=30, min_periods=1).mean()
+    )
+
+    # Improvement 8: Multi-timeframe trend alignment
+    # +3/-3 = all timeframes agree, 0 = mixed signals
+    df["trend_alignment"] = (
+        np.sign(df["momentum_1m"].fillna(0))
+        + np.sign(df["momentum_5m"].fillna(0))
+        + np.sign(df["momentum_10m"].fillna(0))
     )
 
     return df

@@ -26,6 +26,7 @@ FEATURE_COLUMNS = (
     "vol_ratio_5m",
     "vol_ratio_30m",
     "trades_intensity",
+    "trend_alignment",
 )
 
 TARGET_COLUMN = "target"

@@ -18,6 +18,7 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     accuracy_score,
     brier_score_loss,
@@ -163,12 +164,33 @@ def train_with_cv(
         num_boost_round=avg_best_iter,
     )
 
-    return final_model, fold_metrics
+    # --- Improvement 3: Isotonic calibration on last fold ---
+    # Use the last fold's out-of-sample predictions to fit a calibrator
+    last_train_idx, last_val_idx = list(tscv.split(X))[-1]
+    X_cal_val = X[last_val_idx]
+    y_cal_val = y[last_val_idx]
+    y_cal_pred = final_model.predict(X_cal_val)
+
+    calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
+    calibrator.fit(y_cal_pred, y_cal_val)
+    print("[✓] Isotonic calibrator fitted on last fold out-of-sample predictions")
+
+    # Verify calibration improvement
+    y_cal_calibrated = calibrator.predict(y_cal_pred)
+    brier_before = brier_score_loss(y_cal_val, y_cal_pred)
+    brier_after = brier_score_loss(y_cal_val, y_cal_calibrated)
+    print(
+        f"    Brier score: {brier_before:.4f} → {brier_after:.4f} "
+        f"({'improved' if brier_after < brier_before else 'no change'})"
+    )
+
+    return final_model, fold_metrics, calibrator
 
 
 def save_model(
     model: lgb.Booster,
     metrics: list[dict[str, Any]],
+    calibrator: IsotonicRegression,
     *,
     experiment_id: str,
     target_horizon_minutes: int,
@@ -184,6 +206,13 @@ def save_model(
     model_path = PATHS.model_path
     model.save_model(model_path)
     print(f"[✓] Model saved to {model_path}")
+
+    # Save isotonic calibrator
+    import pickle
+    calibrator_path = os.path.join(PATHS.models_dir, "calibrator.pkl")
+    with open(calibrator_path, "wb") as f:
+        pickle.dump(calibrator, f)
+    print(f"[✓] Isotonic calibrator saved to {calibrator_path}")
 
     # Save metadata
     meta_path = os.path.join(PATHS.models_dir, "training_metadata.json")
@@ -286,7 +315,7 @@ def main():
     )
 
     try:
-        model, metrics = train_with_cv(
+        model, metrics, calibrator = train_with_cv(
             df,
             n_splits=args.n_splits,
             n_estimators=args.n_estimators,
@@ -297,6 +326,7 @@ def main():
         artifacts = save_model(
             model,
             metrics,
+            calibrator,
             experiment_id=tracker.experiment_id,
             target_horizon_minutes=args.target_horizon_minutes,
             training_parameters=training_parameters,

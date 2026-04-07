@@ -31,6 +31,7 @@ from src.execution.position_manager import PositionManager
 from src.execution.probability_estimator import MarketProbabilityEstimator
 from src.execution.risk_manager import RiskManager
 from src.features.pipeline import FeaturePipeline
+from src.features.trend_filter import TrendFilter
 from src.utils.logging_config import setup_logging
 from src.utils.model_metadata import DEFAULT_TARGET_HORIZON_MINUTES
 from src.utils.run_governance import (
@@ -66,6 +67,7 @@ class TradingEngine:
         self._model = ModelInference()
         self._probability_estimator = MarketProbabilityEstimator()
         self._pipeline = FeaturePipeline(self._state)
+        self._trend_filter = TrendFilter()
         
         # Exchange clients
         self._binance_rest = BinanceRESTClient()
@@ -645,6 +647,17 @@ class TradingEngine:
             return
 
         signal = self._router.get_signal(prob, self._active_market)
+
+        # Improvement 2: EMA trend confirmation filter
+        if signal is not None and not self._trend_filter.confirms_direction(
+            signal.side, self._state
+        ):
+            logger.debug(
+                "Signal blocked by trend filter | side=%s market=%s",
+                signal.side,
+                self._active_market.slug,
+            )
+            signal = None
 
         if self._live_test_gate and not self._live_test_gate.allows_live_trading:
             if signal is not None:
