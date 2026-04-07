@@ -30,7 +30,7 @@ def market_info():
         slug="btc-5min-test",
         yes_token_id="yes-token-abc123",
         no_token_id="no-token-def456",
-        end_date="2026-04-05T12:05:00Z",
+        end_date="2099-04-05T12:05:00Z",
     )
 
 
@@ -116,13 +116,18 @@ class TestOrderRouter:
         assert router.orders_rejected == 1
 
     def test_snap_price(self):
-        """Test price snapping to tick size."""
-        # Price should snap to tick below the ask
+        """Test price snapping to nearest tick (rounds down, no extra subtraction)."""
+        # Exact tick boundary: 0.50 snaps to 0.50
         snapped = OrderRouter._snap_price(0.50)
-        assert snapped == 0.49
+        assert snapped == 0.50
 
+        # Mid-tick: 0.554 snaps down to 0.55
+        snapped = OrderRouter._snap_price(0.554)
+        assert snapped == 0.55
+
+        # Exact tick boundary: 0.55 snaps to 0.55
         snapped = OrderRouter._snap_price(0.55)
-        assert snapped == 0.54
+        assert snapped == 0.55
 
     def test_no_trade_on_empty_book(self, router, mock_client, market_info):
         """No trade when order book is empty."""

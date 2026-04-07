@@ -313,7 +313,16 @@ class OrderRouter:
                 self._duplicate_window_seconds,
                 self._duplicate_signals_suppressed,
             )
-            return None
+            return OrderResult(
+                success=False,
+                error="duplicate_signal_suppressed",
+                raw_response={
+                    "reason": "duplicate_signal_suppressed",
+                    "market": market.slug or market.condition_id,
+                    "side": signal.side,
+                    "duplicate_window_seconds": self._duplicate_window_seconds,
+                },
+            )
 
         self._remember_signal(signal_key, signal.timestamp)
 

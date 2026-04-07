@@ -65,7 +65,7 @@ def compute_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         d=FEATURES.fracdiff_d,
     )
 
-    df["vol_1m"] = rolling_volatility_fast(df["log_return"], window=5)  # Bug 3 fix: was window=1 (always 0)
+    df["vol_1m"] = rolling_volatility_fast(df["log_return"], window=3)  # Bug D fix: window=3 (distinct from vol_5m=5)
     df["vol_5m"] = rolling_volatility_fast(df["log_return"], window=5)
     df["vol_30m"] = rolling_volatility_fast(df["log_return"], window=30)
     df["vol_60m"] = rolling_volatility_fast(df["log_return"], window=60)

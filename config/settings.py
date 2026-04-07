@@ -205,10 +205,10 @@ class TradingConfig:
     )
     stop_loss_factor: float = field(
         default_factory=lambda: float(os.getenv("STOP_LOSS_FACTOR", "0.5"))
-    )
+    )  # Fraction of entry price you're willing to lose (0.5 = stop at entry * 0.5)
     take_profit_multiple: float = field(
-        default_factory=lambda: float(os.getenv("TAKE_PROFIT_MULTIPLE", "3.0"))
-    )
+        default_factory=lambda: float(os.getenv("TAKE_PROFIT_MULTIPLE", "0.3"))
+    )  # Fraction of remaining edge to capture (0.3 = TP at entry + 0.3*(1-entry))
     take_profit_fraction: float = field(
         default_factory=lambda: float(os.getenv("TAKE_PROFIT_FRACTION", "0.5"))
     )

@@ -155,7 +155,10 @@ class PositionManager:
         if mark_price is None:
             return None
 
-        stop_loss_price = position.entry_price * self._stop_loss_factor
+        # Bug A fix: `stop_loss_factor` is the max fraction of entry price
+        # you're willing to lose. E.g. factor=0.5 on a 0.50 entry means
+        # stop at 0.50 * (1 - 0.5) = 0.25, i.e. you accept losing $0.25.
+        stop_loss_price = position.entry_price * (1.0 - self._stop_loss_factor)
         if mark_price <= stop_loss_price:
             return {
                 "reason": "stop_loss",
@@ -164,10 +167,17 @@ class PositionManager:
                 "limit_price": self._exit_limit_price(current_bid, current_ask),
             }
 
+        # Bug B fix: on binary markets, prices cap at 1.0 so
+        # `entry * 3.0` is unreachable for any entry > 0.33.
+        # Reinterpret as: TP triggers when unrealized gain reaches
+        # `take_profit_multiple` times the entry edge (1.0 - entry).
+        # E.g. entry=0.50, edge=0.50, multiple=0.3 → TP at 0.50+0.15=0.65
+        tp_edge = (1.0 - position.entry_price) * self._take_profit_multiple
+        take_profit_price = min(position.entry_price + tp_edge, 0.99)
         if (
             not position.take_profit_taken
             and self._take_profit_multiple > 0
-            and mark_price >= position.entry_price * self._take_profit_multiple
+            and mark_price >= take_profit_price
         ):
             exit_size = position.remaining_size * min(max(self._take_profit_fraction, 0.0), 1.0)
             if exit_size > 0:
@@ -213,6 +223,7 @@ class PositionManager:
                 yes_token_id="",
                 no_token_id="",
                 end_date=position.end_date,
+                neg_risk=position.neg_risk,
             )
         )
         if rule.reference_price is None or rule.reference_price <= 0:
