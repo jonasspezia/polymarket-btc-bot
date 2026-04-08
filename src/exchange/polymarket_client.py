@@ -210,8 +210,7 @@ class PolymarketClient:
             response = self._client.post_order(
                 signed_order,
                 OrderType.GTD,
-                False,  # defer_exec
-                True,   # post_only — NEVER change this
+                post_only=True,  # post_only — NEVER change this
             )
 
             order_id = response.get("orderID", response.get("id", "unknown"))

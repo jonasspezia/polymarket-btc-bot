@@ -177,7 +177,7 @@ class TestOrderRouter:
         """Paper diagnostics should not treat a deep resting maker order as filled."""
         router = _build_router(mock_client, dry_run=True)
         mock_client.get_best_bid_ask.side_effect = [
-            (0.04, 0.50),
+            (0.30, 0.50),  # YES: spread=0.20, entry=0.31 (far from ask=0.50)
             (0.49, 0.50),
         ]
 
@@ -484,7 +484,7 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """Paper trading should fall back to indicative prices when asks are unusable."""
-        router = _build_router(mock_client, dry_run=True)
+        router = _build_router(mock_client, dry_run=True, max_spread=1.0)
         market = MarketInfo(
             condition_id=market_info.condition_id,
             question=market_info.question,
