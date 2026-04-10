@@ -39,6 +39,8 @@ class RiskManager:
         pnl_floor: Optional[float] = None,
         max_positions: Optional[int] = None,
         private_check_cache_ttl_seconds: Optional[float] = None,
+        min_available_collateral: Optional[float] = None,
+        max_available_collateral_drawdown: Optional[float] = None,
     ):
         self._state = state
         self._client = client
@@ -73,6 +75,16 @@ class RiskManager:
             if private_check_cache_ttl_seconds is not None
             else RISK.private_check_cache_ttl_seconds
         )
+        self._min_available_collateral = (
+            min_available_collateral
+            if min_available_collateral is not None
+            else getattr(RISK, "min_available_collateral", 0.0)
+        )
+        self._max_available_collateral_drawdown = (
+            max_available_collateral_drawdown
+            if max_available_collateral_drawdown is not None
+            else getattr(RISK, "max_available_collateral_drawdown", 0.0)
+        )
         self._read_only_mode = read_only_mode
 
         # Internal state
@@ -95,6 +107,8 @@ class RiskManager:
         self._last_balance_check_monotonic = 0.0
         self._cached_balance_check_result: Optional[bool] = None
         self._cached_collateral_status = None
+        self._starting_available_collateral: Optional[float] = None
+        self._lowest_available_collateral: Optional[float] = None
 
     @property
     def is_trading_allowed(self) -> bool:
@@ -299,8 +313,65 @@ class RiskManager:
             self._cached_balance_check_result = False
             return False
 
+        available_to_trade = float(status.available_to_trade)
+        self._update_collateral_baseline(available_to_trade)
+
+        if (
+            self._min_available_collateral > 0
+            and available_to_trade + 1e-9 < self._min_available_collateral
+        ):
+            logger.critical(
+                "Available collateral below live safety floor | available=%.4f min_required=%.4f",
+                available_to_trade,
+                self._min_available_collateral,
+            )
+            self._cached_balance_check_result = False
+            self._trading_halted = True
+            self._trigger_kill_switch()
+            return False
+
+        if (
+            self._starting_available_collateral is not None
+            and self._max_available_collateral_drawdown > 0
+        ):
+            drawdown = self._starting_available_collateral - available_to_trade
+            if drawdown > self._max_available_collateral_drawdown + 1e-9:
+                logger.critical(
+                    "Available collateral drawdown breached | baseline=%.4f current=%.4f drawdown=%.4f max_drawdown=%.4f",
+                    self._starting_available_collateral,
+                    available_to_trade,
+                    drawdown,
+                    self._max_available_collateral_drawdown,
+                )
+                self._cached_balance_check_result = False
+                self._trading_halted = True
+                self._trigger_kill_switch()
+                return False
+
         self._cached_balance_check_result = True
         return True
+
+    def _update_collateral_baseline(self, available_to_trade: float) -> None:
+        """Track the session collateral baseline for drawdown guardrails."""
+        if self._starting_available_collateral is None:
+            self._starting_available_collateral = available_to_trade
+            self._lowest_available_collateral = available_to_trade
+            logger.info(
+                "Collateral baseline initialized | available=%.4f min_floor=%.4f max_drawdown=%.4f",
+                available_to_trade,
+                self._min_available_collateral,
+                self._max_available_collateral_drawdown,
+            )
+            return
+
+        if self._lowest_available_collateral is None:
+            self._lowest_available_collateral = available_to_trade
+            return
+
+        self._lowest_available_collateral = min(
+            self._lowest_available_collateral,
+            available_to_trade,
+        )
 
     def run_all_checks(
         self,
@@ -396,6 +467,12 @@ class RiskManager:
                 self._cooldown_seconds - (time.time() - self._kill_time)
                 if self._kill_time else 0,
             ),
+            "min_available_collateral": self._min_available_collateral,
+            "max_available_collateral_drawdown": (
+                self._max_available_collateral_drawdown
+            ),
+            "starting_available_collateral": self._starting_available_collateral,
+            "lowest_available_collateral": self._lowest_available_collateral,
             "vol_history_size": len(self._vol_history),
             "cached_open_order_count": self._cached_open_order_count,
         }

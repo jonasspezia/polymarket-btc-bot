@@ -1,5 +1,8 @@
 # Environment & Secrets
 .env
+secrets/*
+!secrets/
+!secrets/.gitkeep
 node_modules/
 *.pem
 *.key
@@ -21,16 +24,21 @@ env/
 .pip-cache/
 
 # Data (large files, not tracked)
-data/raw/
-data/processed/*.parquet
-data/artifacts/
+data/raw/*
+!data/raw/
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/
+!data/processed/.gitkeep
+data/artifacts/*
+!data/artifacts/
+!data/artifacts/.gitkeep
 data/models/*.pkl
 data/models/*.txt
 data/models/training_metadata.json
 data/models/validation_report.json
+!data/models/
 !data/models/.gitkeep
-!data/processed/.gitkeep
-!data/raw/.gitkeep
 
 # IDE
 .vscode/
@@ -48,7 +56,12 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
+logs/*
+!logs/
+!logs/.gitkeep
+
+# Deployment
+deploy/swarm-stack.generated.yml
 
 # Node
 node_modules/

@@ -35,12 +35,13 @@ class _FakeTradingConfig:
     dry_run: bool = False
     validation_only_mode: bool = False
     live_trading_enabled: bool = True
-    allow_non_5m_live_markets: bool = True
+    allow_non_5m_live_markets: bool = False
     order_size: float = 1.0
     order_notional: float = 0.0
-    min_edge: float = 0.02
-    min_side_probability: float = 0.52
-    max_entry_price: float = 0.90
+    min_edge: float = 0.04
+    min_side_probability: float = 0.56
+    max_entry_price: float = 0.68
+    max_spread: float = 0.12
     strategy_style: str = "momentum"
     probability_vol_window_seconds: int = 300
     probability_min_sigma: float = 0.0015
@@ -49,7 +50,7 @@ class _FakeTradingConfig:
     max_ask_wall_ratio: float = 2.5
     gtd_ttl_seconds: int = 10
     post_only: bool = True
-    max_open_positions: int = 3
+    max_open_positions: int = 1
     duplicate_signal_window_seconds: int = 15
     require_live_test_before_live_orders: bool = True
     live_test_window_seconds: int = 600
@@ -58,15 +59,18 @@ class _FakeTradingConfig:
     live_test_min_profit: float = 0.01
     live_test_max_cumulative_loss: float = 0.0
     allow_upsize_to_min_order_size: bool = False
-    bankroll_fraction_per_order: float = 1.0
+    bankroll_fraction_per_order: float = 0.25
     max_order_notional: float = 0.0
     reserve_collateral_amount: float = 0.0
     enable_dynamic_exits: bool = True
     stop_loss_factor: float = 0.5
     take_profit_multiple: float = 3.0
     take_profit_fraction: float = 0.5
-    time_decay_exit_seconds: int = 1800
+    time_decay_exit_seconds: int = 180
     time_decay_distance_pct: float = 0.005
+    min_time_remaining_seconds: int = 120
+    use_kelly_sizing: bool = False
+    kelly_fraction: float = 0.10
     tick_size: str = "0.01"
 
 
@@ -77,6 +81,8 @@ class _FakeRiskConfig:
     volatility_min_relative_multiplier: float = 4.0
     kill_switch_cooldown_seconds: int = 60
     pnl_floor: float = -0.2
+    min_available_collateral: float = 10.0
+    max_available_collateral_drawdown: float = 1.0
     private_check_cache_ttl_seconds: float = 5.0
     vol_lookback_window: int = 300
 
@@ -100,17 +106,20 @@ def test_validate_runtime_configuration_rejects_inconsistent_notional_limits(
         "src.utils.run_governance.TRADING",
         SimpleNamespace(
             live_trading_enabled=True,
-            min_edge=0.02,
-            min_side_probability=0.52,
-            max_entry_price=0.90,
+            min_edge=0.04,
+            min_side_probability=0.56,
+            max_entry_price=0.68,
+            max_spread=0.12,
             gtd_ttl_seconds=10,
-            max_open_positions=3,
+            max_open_positions=1,
             duplicate_signal_window_seconds=15,
             order_size=1.0,
             order_notional=5.0,
             max_order_notional=1.0,
-            bankroll_fraction_per_order=1.0,
+            bankroll_fraction_per_order=0.25,
             reserve_collateral_amount=0.0,
+            min_time_remaining_seconds=120,
+            time_decay_exit_seconds=180,
         ),
     )
     monkeypatch.setattr(
@@ -122,6 +131,8 @@ def test_validate_runtime_configuration_rejects_inconsistent_notional_limits(
             kill_switch_cooldown_seconds=60,
             private_check_cache_ttl_seconds=5.0,
             pnl_floor=-0.2,
+            min_available_collateral=10.0,
+            max_available_collateral_drawdown=1.0,
         ),
     )
 
@@ -136,17 +147,20 @@ def test_validate_runtime_configuration_rejects_invalid_volatility_guards(
         "src.utils.run_governance.TRADING",
         SimpleNamespace(
             live_trading_enabled=True,
-            min_edge=0.02,
-            min_side_probability=0.52,
-            max_entry_price=0.90,
+            min_edge=0.04,
+            min_side_probability=0.56,
+            max_entry_price=0.68,
+            max_spread=0.12,
             gtd_ttl_seconds=10,
-            max_open_positions=3,
+            max_open_positions=1,
             duplicate_signal_window_seconds=15,
             order_size=1.0,
             order_notional=0.0,
             max_order_notional=0.0,
-            bankroll_fraction_per_order=1.0,
+            bankroll_fraction_per_order=0.25,
             reserve_collateral_amount=0.0,
+            min_time_remaining_seconds=120,
+            time_decay_exit_seconds=180,
         ),
     )
     monkeypatch.setattr(
@@ -158,12 +172,58 @@ def test_validate_runtime_configuration_rejects_invalid_volatility_guards(
             kill_switch_cooldown_seconds=60,
             private_check_cache_ttl_seconds=5.0,
             pnl_floor=-0.2,
+            min_available_collateral=10.0,
+            max_available_collateral_drawdown=1.0,
         ),
     )
 
     with pytest.raises(
         RuntimeConfigurationError,
         match="VOLATILITY_MIN_ABSOLUTE_THRESHOLD",
+    ):
+        validate_runtime_configuration(dry_run=False, validation_only=False)
+
+
+def test_validate_runtime_configuration_rejects_permissive_live_settings(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "src.utils.run_governance.TRADING",
+        SimpleNamespace(
+            live_trading_enabled=True,
+            min_edge=0.02,
+            min_side_probability=0.52,
+            max_entry_price=0.90,
+            max_spread=0.30,
+            gtd_ttl_seconds=10,
+            max_open_positions=3,
+            duplicate_signal_window_seconds=15,
+            order_size=1.0,
+            order_notional=0.0,
+            max_order_notional=0.0,
+            bankroll_fraction_per_order=1.0,
+            reserve_collateral_amount=0.0,
+            min_time_remaining_seconds=30,
+            time_decay_exit_seconds=1800,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.utils.run_governance.RISK",
+        SimpleNamespace(
+            volatility_sigma_threshold=3.0,
+            volatility_min_absolute_threshold=0.00005,
+            volatility_min_relative_multiplier=4.0,
+            kill_switch_cooldown_seconds=60,
+            private_check_cache_ttl_seconds=5.0,
+            pnl_floor=-0.2,
+            min_available_collateral=0.0,
+            max_available_collateral_drawdown=0.0,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeConfigurationError,
+        match="MIN_SIDE_PROBABILITY|MAX_ENTRY_PRICE|MAX_SPREAD|MAX_OPEN_POSITIONS",
     ):
         validate_runtime_configuration(dry_run=False, validation_only=False)
 

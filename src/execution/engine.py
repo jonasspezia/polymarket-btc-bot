@@ -7,6 +7,7 @@ Usage:
     python -m src.execution.engine
 """
 
+from collections import Counter
 import argparse
 import asyncio
 import logging
@@ -93,6 +94,13 @@ class TradingEngine:
         
         # Current market
         self._active_market: Optional[MarketInfo] = None
+        self._market_ready_event = asyncio.Event()
+        self._inference_waiting_for_market_logged = False
+        self._near_expiry_refresh_cooldown_seconds = 5.0
+        self._next_near_expiry_refresh_at = 0.0
+        self._near_expiry_refresh_condition_id: Optional[str] = None
+        self._market_rejection_backoff_until_by_key: dict[str, float] = {}
+        self._market_family_rejection_backoff_until_by_key: dict[str, float] = {}
         self._tracked_realized_pnl_by_position: dict[str, float] = {}
         self._realized_pnl_baseline_initialized = False
         self._last_live_horizon_notice_key: Optional[tuple[str, str, Optional[int]]] = None
@@ -105,6 +113,16 @@ class TradingEngine:
     def _is_validation_only_mode(self) -> bool:
         """Return True when authenticated checks should run without live orders."""
         return self._validation_only_mode
+
+    def _set_active_market(self, market: Optional[MarketInfo]) -> None:
+        """Keep active-market state and inference gating in sync."""
+        self._active_market = market
+        if market is None:
+            self._market_ready_event.clear()
+            return
+
+        self._market_ready_event.set()
+        self._inference_waiting_for_market_logged = False
 
     def _mode_label(self) -> str:
         if self._is_validation_only_mode():
@@ -216,17 +234,14 @@ class TradingEngine:
 
         Validation-only mode may still observe other market families, but live
         orders should not be routed into a market whose resolution interval does
-        not match the loaded model's target horizon.
+        not match the primary loaded model's target horizon.
         """
         if self._is_read_only_mode():
             return True
 
         interval = getattr(market, "market_interval_minutes", None)
-        supported_intervals = set(self._configured_model_horizons())
         expected_interval = self._expected_market_interval_minutes()
-        if not supported_intervals:
-            supported_intervals = {expected_interval}
-        if interval is None or interval in supported_intervals:
+        if interval is None or interval == expected_interval:
             self._last_live_horizon_notice_key = None
             return True
         if getattr(TRADING, "allow_non_5m_live_markets", False):
@@ -254,6 +269,431 @@ class TradingEngine:
             self._last_live_horizon_notice_key = notice_key
         return False
 
+    @staticmethod
+    def _market_poll_retry_interval_seconds() -> float:
+        """Retry discovery faster when no executable market is currently active."""
+        try:
+            return max(float(getattr(POLYMARKET, "market_poll_retry_seconds", 5)), 1.0)
+        except (TypeError, ValueError):
+            return 5.0
+
+    @staticmethod
+    def _market_rejection_backoff_seconds() -> float:
+        """Cooldown applied after rejecting a market as untradeable."""
+        try:
+            return max(
+                float(getattr(POLYMARKET, "market_rejection_backoff_seconds", 15)),
+                1.0,
+            )
+        except (TypeError, ValueError):
+            return 15.0
+
+    @staticmethod
+    def _market_pathological_backoff_seconds() -> float:
+        """Longer cooldown for dead books with clearly pathological quotes."""
+        try:
+            return max(
+                float(
+                    getattr(
+                        POLYMARKET,
+                        "market_pathological_backoff_seconds",
+                        60,
+                    )
+                ),
+                1.0,
+            )
+        except (TypeError, ValueError):
+            return 60.0
+
+    @staticmethod
+    def _diagnostics_pathological(diagnostics: Optional[dict]) -> bool:
+        """Detect whether discovery diagnostics indicate a dead/pathological book."""
+        if not isinstance(diagnostics, dict):
+            return False
+        return bool(diagnostics.get("pathological"))
+
+    @staticmethod
+    def _market_rejection_key(market: MarketInfo) -> Optional[str]:
+        """Return a stable identifier for per-market cooldowns."""
+        return market.condition_id or market.slug or None
+
+    @staticmethod
+    def _market_family_key(market: MarketInfo) -> Optional[str]:
+        """Group related markets so dead families can be skipped as a unit."""
+        slug = (market.slug or "").lower()
+        question = (market.question or "").lower()
+        if slug.startswith("btc-updown-5m-"):
+            return "btc-updown-5m"
+
+        interval = TradingEngine._parse_target_horizon_minutes(
+            getattr(market, "market_interval_minutes", None)
+        )
+        if interval == 60 or "hourly" in slug or "hourly" in question:
+            return "btc-hourly-series"
+        if interval == 5:
+            return "btc-5m-listed"
+        return None
+
+    def _prune_market_family_rejection_backoffs(
+        self,
+        now_ts: Optional[float] = None,
+    ) -> None:
+        """Drop expired family cooldown entries."""
+        now_ts = time.time() if now_ts is None else now_ts
+        expired_keys = [
+            key
+            for key, backoff_until in self._market_family_rejection_backoff_until_by_key.items()
+            if backoff_until <= now_ts
+        ]
+        for key in expired_keys:
+            self._market_family_rejection_backoff_until_by_key.pop(key, None)
+
+    def _market_family_rejection_remaining_seconds(
+        self,
+        family_key: Optional[str],
+        now_ts: Optional[float] = None,
+    ) -> float:
+        """Return remaining cooldown for a rejected market family, if any."""
+        if not family_key:
+            return 0.0
+
+        now_ts = time.time() if now_ts is None else now_ts
+        self._prune_market_family_rejection_backoffs(now_ts)
+        backoff_until = self._market_family_rejection_backoff_until_by_key.get(family_key)
+        if backoff_until is None:
+            return 0.0
+        return max(backoff_until - now_ts, 0.0)
+
+    def _market_family_rejection_sleep_seconds(
+        self,
+        family_key: Optional[str],
+        markets: list[MarketInfo],
+        now_ts: Optional[float] = None,
+    ) -> float:
+        """Sleep until family cooldown expires or the nearest market window rolls."""
+        now_ts = time.time() if now_ts is None else now_ts
+        remaining_backoff = self._market_family_rejection_remaining_seconds(
+            family_key,
+            now_ts,
+        )
+        if remaining_backoff <= 0:
+            return self._market_poll_retry_interval_seconds()
+
+        sleep_seconds = remaining_backoff
+        end_times = [
+            GammaAPIClient._parse_iso_timestamp(market.end_date)
+            for market in markets
+        ]
+        future_end_times = [
+            end_ts
+            for end_ts in end_times
+            if end_ts is not None and end_ts > now_ts
+        ]
+        if future_end_times:
+            sleep_seconds = min(
+                sleep_seconds,
+                max(min(future_end_times) - now_ts, 1.0),
+            )
+
+        return max(sleep_seconds, 1.0)
+
+    def _prune_market_rejection_backoffs(self, now_ts: Optional[float] = None) -> None:
+        """Drop expired market cooldown entries."""
+        now_ts = time.time() if now_ts is None else now_ts
+        expired_keys = [
+            key
+            for key, backoff_until in self._market_rejection_backoff_until_by_key.items()
+            if backoff_until <= now_ts
+        ]
+        for key in expired_keys:
+            self._market_rejection_backoff_until_by_key.pop(key, None)
+
+    def _market_rejection_remaining_seconds(
+        self,
+        market: MarketInfo,
+        now_ts: Optional[float] = None,
+    ) -> float:
+        """Return remaining cooldown for a rejected market, if any."""
+        now_ts = time.time() if now_ts is None else now_ts
+        self._prune_market_rejection_backoffs(now_ts)
+
+        key = self._market_rejection_key(market)
+        if not key:
+            return 0.0
+
+        backoff_until = self._market_rejection_backoff_until_by_key.get(key)
+        if backoff_until is None:
+            return 0.0
+        return max(backoff_until - now_ts, 0.0)
+
+    def _market_rejection_sleep_seconds(
+        self,
+        market: MarketInfo,
+        now_ts: Optional[float] = None,
+    ) -> float:
+        """
+        Sleep until either cooldown expires or the market window rolls over.
+        """
+        now_ts = time.time() if now_ts is None else now_ts
+        remaining_backoff = self._market_rejection_remaining_seconds(market, now_ts)
+        if remaining_backoff <= 0:
+            return self._market_poll_retry_interval_seconds()
+
+        sleep_seconds = remaining_backoff
+        market_end_ts = GammaAPIClient._parse_iso_timestamp(market.end_date)
+        if market_end_ts is not None and market_end_ts > now_ts:
+            sleep_seconds = min(sleep_seconds, max(market_end_ts - now_ts, 1.0))
+
+        return max(sleep_seconds, 1.0)
+
+    def _record_market_rejection(
+        self,
+        market: MarketInfo,
+        diagnostics: Optional[dict],
+        source: str,
+        now_ts: Optional[float] = None,
+    ) -> float:
+        """Register a temporary cooldown for a market rejected as untradeable."""
+        now_ts = time.time() if now_ts is None else now_ts
+        key = self._market_rejection_key(market)
+        is_pathological = self._diagnostics_pathological(diagnostics)
+        cooldown_seconds = (
+            self._market_pathological_backoff_seconds()
+            if is_pathological
+            else self._market_rejection_backoff_seconds()
+        )
+        if key:
+            self._market_rejection_backoff_until_by_key[key] = now_ts + cooldown_seconds
+
+        logger.info(
+            "%s rejected market as untradeable | slug=%s rejection_class=%s backoff_seconds=%.1f diagnostics=%s",
+            source,
+            market.slug,
+            "pathological" if is_pathological else "standard",
+            cooldown_seconds,
+            diagnostics,
+        )
+        return self._market_rejection_sleep_seconds(market, now_ts)
+
+    def _record_market_family_rejection(
+        self,
+        family_key: Optional[str],
+        markets: list[MarketInfo],
+        source: str,
+        now_ts: Optional[float] = None,
+    ) -> float:
+        """Register a temporary cooldown for an entire pathological market family."""
+        if not family_key:
+            return self._market_poll_retry_interval_seconds()
+
+        now_ts = time.time() if now_ts is None else now_ts
+        cooldown_seconds = self._market_pathological_backoff_seconds()
+        self._market_family_rejection_backoff_until_by_key[family_key] = (
+            now_ts + cooldown_seconds
+        )
+        logger.info(
+            "%s cooled down pathological family | family=%s markets=%d backoff_seconds=%.1f",
+            source,
+            family_key,
+            len(markets),
+            cooldown_seconds,
+        )
+        return self._market_family_rejection_sleep_seconds(
+            family_key,
+            markets,
+            now_ts,
+        )
+
+    def _clear_market_rejection(self, market: Optional[MarketInfo]) -> None:
+        """Remove cooldown state once a market becomes usable again."""
+        if market is None:
+            return
+        key = self._market_rejection_key(market)
+        if key:
+            self._market_rejection_backoff_until_by_key.pop(key, None)
+
+    def _clear_market_family_rejection(self, market: Optional[MarketInfo]) -> None:
+        """Remove family cooldown state once a market from that family is usable again."""
+        if market is None:
+            return
+        family_key = self._market_family_key(market)
+        if family_key:
+            self._market_family_rejection_backoff_until_by_key.pop(family_key, None)
+
+    @staticmethod
+    def _discovery_rejection_reasons(diagnostics: Optional[dict]) -> list[str]:
+        """Extract stable rejection reasons from per-side discovery diagnostics."""
+        if not isinstance(diagnostics, dict):
+            return ["unknown"]
+
+        labels: set[str] = set()
+        for side_key in ("yes", "no"):
+            side_diagnostics = diagnostics.get(side_key)
+            if not isinstance(side_diagnostics, dict):
+                continue
+            pathology_reason = side_diagnostics.get("pathology_reason")
+            reason = side_diagnostics.get("reason")
+            if pathology_reason:
+                labels.add(str(pathology_reason))
+            elif reason:
+                labels.add(str(reason))
+
+        if not labels:
+            if diagnostics.get("pathological"):
+                labels.add("pathological")
+            elif diagnostics.get("executable") is False:
+                labels.add("untradeable")
+
+        return sorted(labels) or ["unknown"]
+
+    @staticmethod
+    def _format_discovery_reason_counts(reason_counts: Counter[str]) -> str:
+        """Render aggregated discovery rejection reasons into a compact log field."""
+        if not reason_counts:
+            return "none"
+        return ",".join(
+            f"{reason}:{count}"
+            for reason, count in reason_counts.most_common()
+        )
+
+    def _log_discovery_cycle_summary(
+        self,
+        *,
+        candidates_total: int,
+        families_total: int,
+        markets_assessed: int,
+        markets_rejected: int,
+        family_backoff_skips: int,
+        market_backoff_skips: int,
+        pathological_families: int,
+        selected_market_slug: Optional[str],
+        sleep_interval: float,
+        reason_counts: Counter[str],
+    ) -> None:
+        """Emit a single periodic summary line for each discovery cycle."""
+        logger.info(
+            "Discovery cycle summary | candidates=%d families=%d assessed=%d rejected=%d family_backoff_skips=%d market_backoff_skips=%d pathological_families=%d selected=%s next_poll=%.1fs reasons=%s",
+            candidates_total,
+            families_total,
+            markets_assessed,
+            markets_rejected,
+            family_backoff_skips,
+            market_backoff_skips,
+            pathological_families,
+            selected_market_slug or "none",
+            sleep_interval,
+            self._format_discovery_reason_counts(reason_counts),
+        )
+
+    def _assess_market_executability(
+        self,
+        market: MarketInfo,
+    ) -> tuple[bool, Optional[dict]]:
+        """
+        Evaluate whether a discovered market should enter the active loop.
+
+        Fail open if the router cannot provide diagnostics so the bot does not
+        accidentally deadlock because of an observability bug.
+        """
+        if not self._router:
+            return True, None
+
+        assess_market = getattr(self._router, "assess_market_executability", None)
+        if not callable(assess_market):
+            return True, None
+
+        try:
+            diagnostics = assess_market(market)
+        except Exception as exc:
+            logger.warning(
+                "Failed to assess market executability; keeping discovery permissive "
+                "| slug=%s error=%s",
+                market.slug,
+                exc,
+            )
+            return True, None
+
+        return bool(diagnostics.get("executable")), diagnostics
+
+    def _get_market_discovery_candidates(self) -> list[MarketInfo]:
+        """
+        Return ordered discovery candidates from Gamma, falling back to the
+        legacy single-market getter when the richer API is unavailable.
+        """
+        get_candidates = getattr(
+            self._gamma,
+            "get_active_btc_5m_market_candidates",
+            None,
+        )
+        if callable(get_candidates):
+            candidates = list(get_candidates(force_refresh=True) or [])
+            if candidates:
+                return candidates
+
+        get_market = getattr(self._gamma, "get_active_btc_5m_market", None)
+        if not callable(get_market):
+            return []
+
+        market = get_market(force_refresh=True)
+        return [market] if market else []
+
+    def _group_market_discovery_candidates(
+        self,
+        candidates: list[MarketInfo],
+    ) -> list[tuple[str, list[MarketInfo]]]:
+        """Preserve candidate order while grouping related markets into families."""
+        grouped: dict[str, list[MarketInfo]] = {}
+        for market in candidates:
+            family_key = (
+                self._market_family_key(market)
+                or self._market_rejection_key(market)
+                or f"market:{len(grouped)}"
+            )
+            grouped.setdefault(family_key, []).append(market)
+        return list(grouped.items())
+
+    def _rank_executable_market_candidate(
+        self,
+        market: MarketInfo,
+        diagnostics: Optional[dict],
+    ) -> tuple[float, float, float, float, str]:
+        """
+        Rank executable discovery candidates by practical live tradability.
+
+        Preference order:
+        1. Native-horizon markets first (5m over fallback hourly when both work).
+        2. Tightest executable spread.
+        3. Price closer to the middle band.
+        4. Lower executable ask to preserve edge headroom.
+        """
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        expected_interval = self._expected_market_interval_minutes()
+        market_interval = self._parse_target_horizon_minutes(
+            getattr(market, "market_interval_minutes", None)
+        )
+        native_horizon_penalty = (
+            0.0 if market_interval in {0, expected_interval} else 1.0
+        )
+        best_spread = diagnostics.get("best_executable_spread")
+        if best_spread is None:
+            best_spread = float("inf")
+        best_mid_price = diagnostics.get("best_executable_mid_price")
+        center_distance = (
+            abs(float(best_mid_price) - 0.5)
+            if best_mid_price is not None
+            else 1.0
+        )
+        best_price = diagnostics.get("best_executable_price")
+        if best_price is None:
+            best_price = float("inf")
+        return (
+            native_horizon_penalty,
+            float(best_spread),
+            center_distance,
+            float(best_price),
+            market.slug or market.condition_id or "",
+        )
+
     def _refresh_active_market_if_needed(self) -> bool:
         """
         Refresh the active market when it is expired or close to expiry.
@@ -264,15 +704,29 @@ class TradingEngine:
         if self._active_market is None:
             return False
 
+        def reset_near_expiry_refresh() -> None:
+            self._next_near_expiry_refresh_at = 0.0
+            self._near_expiry_refresh_condition_id = None
+
         now_ts = time.time()
         market_end_ts = GammaAPIClient._parse_iso_timestamp(self._active_market.end_date)
         if market_end_ts is None:
+            reset_near_expiry_refresh()
             return True
 
         expires_in = market_end_ts - now_ts
         should_refresh = expires_in <= 60
         if not should_refresh:
+            reset_near_expiry_refresh()
             return True
+
+        current_market = self._active_market
+        current_condition_id = current_market.condition_id
+        if (
+            self._near_expiry_refresh_condition_id == current_condition_id
+            and now_ts < self._next_near_expiry_refresh_at
+        ):
+            return expires_in > 0
 
         if expires_in <= 0:
             logger.warning(
@@ -281,10 +735,14 @@ class TradingEngine:
                 self._active_market.end_date,
             )
 
+        self._near_expiry_refresh_condition_id = current_condition_id
+        self._next_near_expiry_refresh_at = (
+            now_ts + self._near_expiry_refresh_cooldown_seconds
+        )
+
         refreshed = self._gamma.get_active_btc_5m_market(force_refresh=True)
         if refreshed is None:
-            self._active_market = None
-            return False
+            return expires_in > 0
 
         refreshed_end_ts = GammaAPIClient._parse_iso_timestamp(refreshed.end_date)
         if refreshed_end_ts is not None and refreshed_end_ts <= now_ts:
@@ -293,20 +751,36 @@ class TradingEngine:
                 refreshed.slug,
                 refreshed.end_date,
             )
-            self._active_market = None
+            return expires_in > 0
+
+        market_is_executable, diagnostics = self._assess_market_executability(
+            refreshed
+        )
+        if not market_is_executable:
+            self._record_market_rejection(
+                refreshed,
+                diagnostics,
+                source="Near-expiry refresh",
+                now_ts=now_ts,
+            )
+            self._set_active_market(None)
+            reset_near_expiry_refresh()
             return False
 
-        if self._active_market.condition_id != refreshed.condition_id:
+        if current_condition_id != refreshed.condition_id:
             logger.info(
                 "Refreshed near-expiry market | old=%s new=%s",
-                self._active_market.slug,
+                current_market.slug,
                 refreshed.slug,
             )
+            reset_near_expiry_refresh()
 
-        self._active_market = refreshed
-        asyncio.create_task(
-            self._pm_ws.subscribe([refreshed.yes_token_id, refreshed.no_token_id])
-        )
+        self._clear_market_rejection(refreshed)
+        self._set_active_market(refreshed)
+        if current_condition_id != refreshed.condition_id:
+            asyncio.create_task(
+                self._pm_ws.subscribe([refreshed.yes_token_id, refreshed.no_token_id])
+            )
         return True
 
     def _run_private_connectivity_checks(
@@ -639,34 +1113,260 @@ class TradingEngine:
         """Task 3: Poll Gamma API for the active BTC market."""
         logger.info("Starting market discovery loop...")
         poll_interval = POLYMARKET.market_poll_interval_seconds
+        retry_interval = self._market_poll_retry_interval_seconds()
 
         try:
             while self._running:
+                sleep_interval = poll_interval
                 try:
-                    market = self._gamma.get_active_btc_5m_market(force_refresh=True)
-                    if market:
-                        if (
-                            self._active_market is None
-                            or market.condition_id != self._active_market.condition_id
+                    candidates = self._get_market_discovery_candidates()
+                    reason_counts: Counter[str] = Counter()
+                    markets_assessed = 0
+                    markets_rejected = 0
+                    family_backoff_skips = 0
+                    market_backoff_skips = 0
+                    pathological_families = 0
+                    selected_market_slug: Optional[str] = None
+                    families_total = 0
+                    executable_candidates: list[
+                        tuple[
+                            tuple[float, float, float, float, str],
+                            int,
+                            int,
+                            MarketInfo,
+                            Optional[dict],
+                        ]
+                    ] = []
+                    if candidates:
+                        now_ts = time.time()
+                        selected_market: Optional[MarketInfo] = None
+                        best_retry_sleep: Optional[float] = None
+                        grouped_candidates = self._group_market_discovery_candidates(
+                            candidates
+                        )
+                        families_total = len(grouped_candidates)
+
+                        candidate_rank = 0
+                        for family_index, (family_key, family_markets) in enumerate(
+                            grouped_candidates,
+                            start=1,
                         ):
-                            logger.info(
-                                "New active market | slug=%s yes=%s",
-                                market.slug,
-                                market.yes_token_id[:16] + "...",
-                            )
-                            asyncio.create_task(
-                                self._pm_ws.subscribe(
-                                    [market.yes_token_id, market.no_token_id]
+                            remaining_family_backoff = (
+                                self._market_family_rejection_remaining_seconds(
+                                    family_key,
+                                    now_ts,
                                 )
                             )
-                        self._active_market = market
+                            if remaining_family_backoff > 0:
+                                family_backoff_skips += 1
+                                reason_counts["family_backoff"] += 1
+                                logger.info(
+                                    "Discovery skipped cooled-down family | family=%s rank=%d/%d remaining_backoff=%.1f candidates=%d",
+                                    family_key,
+                                    family_index,
+                                    len(grouped_candidates),
+                                    remaining_family_backoff,
+                                    len(family_markets),
+                                )
+                                self._set_active_market(None)
+                                family_sleep = self._market_family_rejection_sleep_seconds(
+                                    family_key,
+                                    family_markets,
+                                    now_ts,
+                                )
+                                best_retry_sleep = (
+                                    family_sleep
+                                    if best_retry_sleep is None
+                                    else min(best_retry_sleep, family_sleep)
+                                )
+                                candidate_rank += len(family_markets)
+                                continue
+
+                            family_all_pathological = True
+                            family_assessed = False
+
+                            for market in family_markets:
+                                candidate_rank += 1
+                                remaining_rejection_backoff = (
+                                    self._market_rejection_remaining_seconds(
+                                        market,
+                                        now_ts,
+                                    )
+                                )
+                                if remaining_rejection_backoff > 0:
+                                    market_backoff_skips += 1
+                                    reason_counts["market_backoff"] += 1
+                                    logger.info(
+                                        "Discovery skipped cooled-down market | slug=%s rank=%d/%d remaining_backoff=%.1f",
+                                        market.slug,
+                                        candidate_rank,
+                                        len(candidates),
+                                        remaining_rejection_backoff,
+                                    )
+                                    self._set_active_market(None)
+                                    candidate_sleep = self._market_rejection_sleep_seconds(
+                                        market,
+                                        now_ts,
+                                    )
+                                    best_retry_sleep = (
+                                        candidate_sleep
+                                        if best_retry_sleep is None
+                                        else min(best_retry_sleep, candidate_sleep)
+                                    )
+                                    continue
+
+                                if not self._market_supports_live_strategy(market):
+                                    markets_rejected += 1
+                                    reason_counts["unsupported_live_horizon"] += 1
+                                    self._set_active_market(None)
+                                    best_retry_sleep = (
+                                        retry_interval
+                                        if best_retry_sleep is None
+                                        else min(best_retry_sleep, retry_interval)
+                                    )
+                                    continue
+
+                                family_assessed = True
+                                markets_assessed += 1
+                                market_is_executable, diagnostics = (
+                                    self._assess_market_executability(market)
+                                )
+                                if not self._diagnostics_pathological(diagnostics):
+                                    family_all_pathological = False
+
+                                if not market_is_executable:
+                                    markets_rejected += 1
+                                    for reason in self._discovery_rejection_reasons(
+                                        diagnostics
+                                    ):
+                                        reason_counts[reason] += 1
+                                    candidate_sleep = self._record_market_rejection(
+                                        market,
+                                        diagnostics,
+                                        source="Discovery",
+                                        now_ts=now_ts,
+                                    )
+                                    self._set_active_market(None)
+                                    best_retry_sleep = (
+                                        candidate_sleep
+                                        if best_retry_sleep is None
+                                        else min(best_retry_sleep, candidate_sleep)
+                                    )
+                                    continue
+
+                                executable_candidates.append(
+                                    (
+                                        self._rank_executable_market_candidate(
+                                            market,
+                                            diagnostics,
+                                        ),
+                                        candidate_rank,
+                                        family_index,
+                                        market,
+                                        diagnostics,
+                                    )
+                                )
+                                family_all_pathological = False
+
+                            if family_assessed and family_all_pathological:
+                                pathological_families += 1
+                                reason_counts["family_all_pathological"] += 1
+                                family_sleep = self._record_market_family_rejection(
+                                    family_key,
+                                    family_markets,
+                                    source="Discovery",
+                                    now_ts=now_ts,
+                                )
+                                best_retry_sleep = (
+                                    family_sleep
+                                    if best_retry_sleep is None
+                                    else min(best_retry_sleep, family_sleep)
+                                )
+
+                        if executable_candidates:
+                            executable_candidates.sort(
+                                key=lambda item: (
+                                    item[0],
+                                    item[1],
+                                    item[2],
+                                )
+                            )
+                            selected_rank = executable_candidates[0][0]
+                            selected_candidate_rank = executable_candidates[0][1]
+                            selected_family_rank = executable_candidates[0][2]
+                            selected_market = executable_candidates[0][3]
+                            selected_market_slug = selected_market.slug
+                            self._clear_market_rejection(selected_market)
+                            self._clear_market_family_rejection(selected_market)
+                            if selected_candidate_rank > 1:
+                                logger.info(
+                                    "Discovery selected ranked executable market | slug=%s family=%s rank=%d/%d family_rank=%d/%d spread=%.4f center_distance=%.4f best_price=%.4f native_horizon_penalty=%.1f",
+                                    selected_market.slug,
+                                    self._market_family_key(selected_market)
+                                    or "unknown",
+                                    selected_candidate_rank,
+                                    len(candidates),
+                                    selected_family_rank,
+                                    len(grouped_candidates),
+                                    selected_rank[1],
+                                    selected_rank[2],
+                                    selected_rank[3],
+                                    selected_rank[0],
+                                )
+
+                        if selected_market is not None:
+                            if (
+                                self._active_market is None
+                                or selected_market.condition_id
+                                != self._active_market.condition_id
+                            ):
+                                logger.info(
+                                    "New active market | slug=%s yes=%s",
+                                    selected_market.slug,
+                                    selected_market.yes_token_id[:16] + "...",
+                                )
+                                asyncio.create_task(
+                                    self._pm_ws.subscribe(
+                                        [
+                                            selected_market.yes_token_id,
+                                            selected_market.no_token_id,
+                                        ]
+                                    )
+                                )
+                            self._set_active_market(selected_market)
+                        else:
+                            self._set_active_market(None)
+                            logger.info(
+                                "No executable BTC market candidate found; inference remains paused"
+                            )
+                            if best_retry_sleep is not None:
+                                sleep_interval = best_retry_sleep
+                            else:
+                                sleep_interval = retry_interval
                     else:
                         logger.warning("No active BTC market found")
+                        reason_counts["no_candidates"] += 1
+                        self._set_active_market(None)
+                        sleep_interval = retry_interval
+
+                    self._log_discovery_cycle_summary(
+                        candidates_total=len(candidates),
+                        families_total=families_total,
+                        markets_assessed=markets_assessed,
+                        markets_rejected=markets_rejected,
+                        family_backoff_skips=family_backoff_skips,
+                        market_backoff_skips=market_backoff_skips,
+                        pathological_families=pathological_families,
+                        selected_market_slug=selected_market_slug,
+                        sleep_interval=sleep_interval,
+                        reason_counts=reason_counts,
+                    )
 
                 except Exception as e:
                     logger.error("Market discovery error: %s", e)
+                    sleep_interval = retry_interval
 
-                await asyncio.sleep(poll_interval)
+                await asyncio.sleep(sleep_interval)
         except asyncio.CancelledError:
             logger.info("Market discovery stopped")
 
@@ -705,6 +1405,20 @@ class TradingEngine:
 
         try:
             while self._running:
+                if not self._market_ready_event.is_set():
+                    if not self._inference_waiting_for_market_logged:
+                        logger.info(
+                            "Inference paused waiting for executable market candidate"
+                        )
+                        self._inference_waiting_for_market_logged = True
+                    try:
+                        await asyncio.wait_for(
+                            self._market_ready_event.wait(),
+                            timeout=inference_interval,
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+
                 cycle_start = time.time()
 
                 try:

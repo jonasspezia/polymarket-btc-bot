@@ -168,6 +168,132 @@ def test_select_market_from_event_payload_prefers_most_balanced_market():
     assert selected["slug"] == "balanced"
 
 
+def test_select_market_from_event_payload_prefers_healthy_quotes_over_rails():
+    event_payload = {
+        "markets": [
+            {
+                "slug": "balanced-but-pathological",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.05,
+                "bestAsk": 0.95,
+                "liquidityClob": 1000.0,
+            },
+            {
+                "slug": "healthy-alternative",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.44,
+                "bestAsk": 0.48,
+                "liquidityClob": 25.0,
+            },
+        ]
+    }
+
+    selected = GammaAPIClient._select_market_from_event_payload(event_payload)
+
+    assert selected is not None
+    assert selected["slug"] == "healthy-alternative"
+
+
+def test_select_market_from_event_payload_prefers_tighter_healthy_spread_over_balance():
+    event_payload = {
+        "markets": [
+            {
+                "slug": "more-balanced-but-wide",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.47,
+                "bestAsk": 0.67,
+                "liquidityClob": 200.0,
+            },
+            {
+                "slug": "less-balanced-but-tight",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.39,
+                "bestAsk": 0.43,
+                "liquidityClob": 20.0,
+            },
+        ]
+    }
+
+    selected = GammaAPIClient._select_market_from_event_payload(event_payload)
+
+    assert selected is not None
+    assert selected["slug"] == "less-balanced-but-tight"
+
+
+def test_select_markets_from_event_payload_returns_ranked_candidates():
+    event_payload = {
+        "markets": [
+            {
+                "slug": "widish",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.44,
+                "bestAsk": 0.50,
+                "liquidityClob": 30.0,
+            },
+            {
+                "slug": "tight-center",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.48,
+                "bestAsk": 0.51,
+                "liquidityClob": 10.0,
+            },
+            {
+                "slug": "tight-off-center",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.34,
+                "bestAsk": 0.37,
+                "liquidityClob": 50.0,
+            },
+        ]
+    }
+
+    selected = GammaAPIClient._select_markets_from_event_payload(
+        event_payload,
+        limit=2,
+    )
+
+    assert [market["slug"] for market in selected] == [
+        "tight-off-center",
+        "tight-center",
+    ]
+
+
+def test_select_market_from_event_payload_falls_back_when_all_children_are_pathological():
+    event_payload = {
+        "markets": [
+            {
+                "slug": "missing-quotes",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.0,
+                "bestAsk": 0.0,
+                "outcomePrices": ["0.49", "0.51"],
+                "liquidityClob": 20.0,
+            },
+            {
+                "slug": "rails",
+                "active": True,
+                "closed": False,
+                "bestBid": 0.05,
+                "bestAsk": 0.95,
+                "liquidityClob": 10.0,
+            },
+        ]
+    }
+
+    selected = GammaAPIClient._select_market_from_event_payload(event_payload)
+
+    assert selected is not None
+    assert selected["slug"] == "rails"
+
+
 def test_select_best_series_event_prefers_nearest_future_end_time():
     events = [
         {
@@ -327,6 +453,172 @@ def test_fetch_btc_updown_5m_market_prefers_window_containing_now():
     assert market is not None
     assert market.slug == "btc-updown-5m-1775587800"
     assert market.market_interval_minutes == 5
+
+
+def test_fetch_btc_updown_5m_market_candidates_returns_ordered_neighbors():
+    client = GammaAPIClient()
+    now_ts = 1775587968.0
+
+    def fake_fetch(slug, market_interval_minutes=None):
+        start_ts = int(slug.rsplit("-", 1)[-1])
+        return MarketInfo(
+            condition_id=f"condition-{start_ts}",
+            question=f"Bitcoin Up or Down - window {start_ts}",
+            slug=slug,
+            yes_token_id=f"yes-{start_ts}",
+            no_token_id=f"no-{start_ts}",
+            end_date="2026-04-07T18:45:00Z" if start_ts == 1775587200 else
+            "2026-04-07T18:50:00Z" if start_ts == 1775587500 else
+            "2026-04-07T18:55:00Z" if start_ts == 1775587800 else
+            "2026-04-07T19:00:00Z" if start_ts == 1775588100 else
+            "2026-04-07T19:05:00Z",
+            market_interval_minutes=market_interval_minutes,
+        )
+
+    client._fetch_market_from_event_slug = fake_fetch
+
+    candidates = client._fetch_btc_updown_5m_market_candidates(now_ts=now_ts)
+
+    assert [candidate.slug for candidate in candidates] == [
+        "btc-updown-5m-1775587800",
+        "btc-updown-5m-1775588100",
+        "btc-updown-5m-1775588400",
+        "btc-updown-5m-1775587500",
+        "btc-updown-5m-1775587200",
+    ]
+
+
+def test_get_active_btc_5m_market_candidates_prefers_direct_updown_family():
+    client = GammaAPIClient()
+    sentinel_current = MarketInfo(
+        condition_id="0x5m-current",
+        question="Current",
+        slug="btc-updown-5m-current",
+        yes_token_id="yes-current",
+        no_token_id="no-current",
+        end_date="2026-04-07T18:55:00Z",
+        market_interval_minutes=5,
+    )
+    sentinel_next = MarketInfo(
+        condition_id="0x5m-next",
+        question="Next",
+        slug="btc-updown-5m-next",
+        yes_token_id="yes-next",
+        no_token_id="no-next",
+        end_date="2026-04-07T19:00:00Z",
+        market_interval_minutes=5,
+    )
+    listed = MarketInfo(
+        condition_id="0xlisted",
+        question="Listed",
+        slug="bitcoin-up-or-down-listed",
+        yes_token_id="yes-listed",
+        no_token_id="no-listed",
+        end_date="2026-04-07T19:05:00Z",
+        market_interval_minutes=5,
+    )
+    hourly_a = MarketInfo(
+        condition_id="0xhourly-a",
+        question="Hourly A",
+        slug="bitcoin-multi-strikes-hourly-child-a",
+        yes_token_id="yes-hourly-a",
+        no_token_id="no-hourly-a",
+        end_date="2026-04-07T20:00:00Z",
+        market_interval_minutes=60,
+    )
+    hourly_b = MarketInfo(
+        condition_id="0xhourly-b",
+        question="Hourly B",
+        slug="bitcoin-multi-strikes-hourly-child-b",
+        yes_token_id="yes-hourly-b",
+        no_token_id="no-hourly-b",
+        end_date="2026-04-07T21:00:00Z",
+        market_interval_minutes=60,
+    )
+
+    client._fetch_btc_updown_5m_market_candidates = lambda: [
+        sentinel_current,
+        sentinel_next,
+    ]
+    client._fetch_listed_btc_5m_market_candidates = lambda limit=5: [listed]
+    client._fetch_btc_hourly_market_candidates = lambda limit=4: [
+        hourly_a,
+        hourly_b,
+    ]
+
+    candidates = client.get_active_btc_5m_market_candidates(force_refresh=True)
+
+    assert candidates == [
+        sentinel_current,
+        sentinel_next,
+        listed,
+        hourly_a,
+        hourly_b,
+    ]
+
+
+def test_fetch_btc_hourly_market_candidates_returns_ranked_children_from_nearest_events():
+    client = GammaAPIClient()
+    client._get_active_series = lambda: [
+        {
+            "slug": "bitcoin-multi-strikes-hourly",
+            "title": "Bitcoin Multi Strikes Hourly",
+            "events": [
+                {
+                    "slug": "event-near",
+                    "active": True,
+                    "closed": False,
+                    "endDate": "2099-04-07T19:00:00Z",
+                },
+                {
+                    "slug": "event-next",
+                    "active": True,
+                    "closed": False,
+                    "endDate": "2099-04-07T20:00:00Z",
+                },
+            ],
+        }
+    ]
+
+    def fake_fetch(event_slug, market_interval_minutes=None, limit=1):
+        if event_slug == "event-near":
+            return [
+                MarketInfo(
+                    condition_id="0xnear-a",
+                    question="Near A",
+                    slug="near-a",
+                    yes_token_id="yes-near-a",
+                    no_token_id="no-near-a",
+                    end_date="2026-04-07T19:00:00Z",
+                    market_interval_minutes=market_interval_minutes,
+                ),
+                MarketInfo(
+                    condition_id="0xnear-b",
+                    question="Near B",
+                    slug="near-b",
+                    yes_token_id="yes-near-b",
+                    no_token_id="no-near-b",
+                    end_date="2026-04-07T19:00:00Z",
+                    market_interval_minutes=market_interval_minutes,
+                ),
+            ][:limit]
+        return [
+            MarketInfo(
+                condition_id="0xnext-a",
+                question="Next A",
+                slug="next-a",
+                yes_token_id="yes-next-a",
+                no_token_id="no-next-a",
+                end_date="2026-04-07T20:00:00Z",
+                market_interval_minutes=market_interval_minutes,
+            )
+        ][:limit]
+
+    client._fetch_markets_from_event_slug = fake_fetch
+
+    selected = client._fetch_btc_hourly_market_candidates(limit=3)
+
+    assert [market.slug for market in selected] == ["near-a", "near-b", "next-a"]
 
 
 def test_fetch_btc_5m_market_prefers_direct_updown_family_before_hourly_fallback():

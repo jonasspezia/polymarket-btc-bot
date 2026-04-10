@@ -330,6 +330,83 @@ class OrderRouter:
             no_book_snapshot,
         )
 
+    def assess_market_executability(self, market: MarketInfo) -> dict[str, Any]:
+        """
+        Return book-quality diagnostics for discovery-time market filtering.
+
+        A market is considered executable when at least one side has both bid
+        and ask quotes with spread at or below the same `max_spread` threshold
+        enforced later during signal generation, and whose entry ask does not
+        already violate `max_entry_price`.
+        """
+        yes_snapshot = self._summarize_order_book(
+            self._safe_get_order_book(market.yes_token_id)
+        )
+        no_snapshot = self._summarize_order_book(
+            self._safe_get_order_book(market.no_token_id)
+        )
+
+        yes_diagnostics = self._build_market_side_diagnostics(yes_snapshot)
+        no_diagnostics = self._build_market_side_diagnostics(no_snapshot)
+        executable_sides = [
+            side
+            for side, diagnostics in (
+                ("YES", yes_diagnostics),
+                ("NO", no_diagnostics),
+            )
+            if diagnostics["entry_viable"]
+        ]
+        pathological_sides = [
+            side
+            for side, diagnostics in (
+                ("YES", yes_diagnostics),
+                ("NO", no_diagnostics),
+            )
+            if diagnostics["pathological"]
+        ]
+        executable = bool(executable_sides)
+        best_executable_side = None
+        best_executable_spread = None
+        best_executable_price = None
+        best_executable_mid_price = None
+        if executable:
+            best_executable_side, best_side_diagnostics = min(
+                (
+                    ("YES", yes_diagnostics),
+                    ("NO", no_diagnostics),
+                ),
+                key=lambda item: (
+                    0 if item[1]["entry_viable"] else 1,
+                    item[1]["spread"]
+                    if item[1]["spread"] is not None
+                    else float("inf"),
+                    item[1]["center_distance"],
+                    item[1]["best_ask"]
+                    if item[1]["best_ask"] is not None
+                    else float("inf"),
+                ),
+            )
+            if best_side_diagnostics["entry_viable"]:
+                best_executable_spread = best_side_diagnostics["spread"]
+                best_executable_price = best_side_diagnostics["best_ask"]
+                best_executable_mid_price = best_side_diagnostics["mid_price"]
+
+        return {
+            "market": market.slug or market.condition_id,
+            "condition_id": market.condition_id,
+            "max_spread": self._max_spread,
+            "executable": executable,
+            "executable_sides": executable_sides,
+            "best_executable_side": best_executable_side,
+            "best_executable_spread": best_executable_spread,
+            "best_executable_price": best_executable_price,
+            "best_executable_mid_price": best_executable_mid_price,
+            "pathological": (not executable) and bool(pathological_sides),
+            "pathological_sides": pathological_sides,
+            "yes": yes_diagnostics,
+            "no": no_diagnostics,
+        }
+
     def execute_signal(
         self,
         signal: TradingSignal,
@@ -366,8 +443,6 @@ class OrderRouter:
                     "duplicate_window_seconds": self._duplicate_window_seconds,
                 },
             )
-
-        self._remember_signal(signal_key, signal.timestamp)
 
         sizing = self._resolve_order_size(signal, market)
         if not sizing.allowed:
@@ -446,6 +521,7 @@ class OrderRouter:
             signal = replace(signal, size=sizing.size)
 
         if self._dry_run:
+            self._remember_signal(signal_key, signal.timestamp)
             simulated_fill = self._dry_run_result_represents_fill(signal)
             self._orders_simulated += 1
             logger.info(
@@ -497,6 +573,7 @@ class OrderRouter:
             )
 
         # Execute the trade
+        self._remember_signal(signal_key, signal.timestamp)
         result = self._client.place_post_only_gtd(
             token_id=signal.token_id,
             price=signal.price,
@@ -1007,6 +1084,82 @@ class OrderRouter:
             bid_size_total=sum(self._level_size(level) for level in bid_levels),
             ask_size_total=sum(self._level_size(level) for level in ask_levels),
         )
+
+    def _build_market_side_diagnostics(
+        self,
+        snapshot: Optional[OrderBookSnapshot],
+    ) -> dict[str, Any]:
+        """Normalize book quality checks into a stable diagnostics payload."""
+        best_bid = snapshot.best_bid if snapshot else None
+        best_ask = snapshot.best_ask if snapshot else None
+        has_quotes = (
+            best_bid is not None
+            and best_ask is not None
+            and best_bid > 0
+            and best_ask > 0
+        )
+        spread = (best_ask - best_bid) if has_quotes else None
+        spread_ok = bool(spread is not None and spread <= self._max_spread)
+        price_ok = bool(
+            has_quotes
+            and (
+                self._max_entry_price <= 0
+                or self._max_entry_price >= 1
+                or best_ask <= self._max_entry_price + 1e-9
+            )
+        )
+        at_price_rails = bool(
+            has_quotes
+            and best_bid <= 0.05
+            and best_ask >= 0.95
+        )
+        extreme_spread = bool(
+            spread is not None
+            and spread >= max(self._max_spread * 2.0, 0.80)
+        )
+        pathological = bool((not has_quotes) or at_price_rails or extreme_spread)
+
+        if not has_quotes:
+            reason = "missing_quotes"
+        elif not spread_ok:
+            reason = "spread_too_wide"
+        elif not price_ok:
+            reason = "price_too_high"
+        else:
+            reason = None
+
+        if not has_quotes:
+            pathology_reason = "missing_quotes"
+        elif at_price_rails:
+            pathology_reason = "price_rails"
+        elif extreme_spread:
+            pathology_reason = "extreme_spread"
+        else:
+            pathology_reason = None
+
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "spread_ok": spread_ok,
+            "price_ok": price_ok,
+            "entry_viable": spread_ok and price_ok,
+            "reason": reason,
+            "pathological": pathological,
+            "pathology_reason": pathology_reason,
+            "mid_price": (
+                ((best_bid + best_ask) / 2.0)
+                if has_quotes
+                else None
+            ),
+            "center_distance": (
+                abs(((best_bid + best_ask) / 2.0) - 0.5)
+                if has_quotes
+                else 1.0
+            ),
+            "bid_size_total": snapshot.bid_size_total if snapshot else 0.0,
+            "ask_size_total": snapshot.ask_size_total if snapshot else 0.0,
+        }
 
     @staticmethod
     def _extract_book_levels(book) -> tuple[Optional[list], Optional[list]]:

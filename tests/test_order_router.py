@@ -41,6 +41,7 @@ def _build_router(mock_client, **overrides):
         "min_edge": 0.02,
         "min_side_probability": 0.52,
         "max_entry_price": 0.90,
+        "max_spread": 0.30,
         "order_size": 1.0,
         "order_notional": 0.0,
         "gtd_ttl": 10,
@@ -299,6 +300,105 @@ class TestOrderRouter:
         assert router.duplicate_signals_suppressed == 1
         assert mock_client.place_post_only_gtd.call_count == 1
 
+    def test_duplicate_window_is_not_consumed_by_dry_run_sizing_block(
+        self, mock_client, market_info
+    ):
+        """Sizing failures in dry-run should not suppress the next identical signal."""
+        router = _build_router(
+            mock_client,
+            dry_run=True,
+            duplicate_window_seconds=60,
+        )
+        market = MarketInfo(
+            condition_id=market_info.condition_id,
+            question=market_info.question,
+            slug=market_info.slug,
+            yes_token_id=market_info.yes_token_id,
+            no_token_id=market_info.no_token_id,
+            end_date=market_info.end_date,
+            min_order_size=5.0,
+        )
+        mock_client.get_available_collateral.return_value = 0.0
+        mock_client.get_best_bid_ask.side_effect = [
+            (0.48, 0.50),
+            (0.48, 0.50),
+            (0.48, 0.50),
+            (0.48, 0.50),
+        ]
+
+        first = router.evaluate_and_trade(0.55, market)
+        second = router.evaluate_and_trade(0.55, market)
+
+        assert first is not None
+        assert first.success is True
+        assert first.raw_response["live_blocked"] is True
+        assert second is not None
+        assert second.success is True
+        assert second.raw_response["live_blocked"] is True
+        assert router.duplicate_signals_suppressed == 0
+        assert router.orders_simulated == 2
+        mock_client.place_post_only_gtd.assert_not_called()
+
+    def test_duplicate_window_is_not_consumed_by_collateral_guard(
+        self, mock_client, market_info
+    ):
+        """Collateral guard failures should not arm duplicate suppression."""
+        router = _build_router(
+            mock_client,
+            duplicate_window_seconds=60,
+            order_size=10.0,
+        )
+        mock_client.has_sufficient_collateral.return_value = False
+        mock_client.get_best_bid_ask.side_effect = [
+            (0.48, 0.50),
+            (0.48, 0.50),
+            (0.48, 0.50),
+            (0.48, 0.50),
+        ]
+
+        first = router.evaluate_and_trade(0.55, market_info)
+        second = router.evaluate_and_trade(0.55, market_info)
+
+        assert first is not None
+        assert first.success is False
+        assert first.error == "Insufficient balance or allowance"
+        assert second is not None
+        assert second.success is False
+        assert second.error == "Insufficient balance or allowance"
+        assert router.duplicate_signals_suppressed == 0
+        assert router.orders_rejected == 2
+        mock_client.place_post_only_gtd.assert_not_called()
+
+    def test_duplicate_window_still_arms_after_real_order_attempt(
+        self, mock_client, market_info
+    ):
+        """An actual submit attempt should still consume the duplicate window."""
+        router = _build_router(
+            mock_client,
+            duplicate_window_seconds=60,
+        )
+        mock_client.place_post_only_gtd.return_value = MagicMock(
+            success=False, error="Post-only rejected"
+        )
+        mock_client.get_best_bid_ask.side_effect = [
+            (0.48, 0.50),
+            (0.48, 0.50),
+            (0.48, 0.50),
+            (0.48, 0.50),
+        ]
+
+        first = router.evaluate_and_trade(0.55, market_info)
+        second = router.evaluate_and_trade(0.55, market_info)
+
+        assert first is not None
+        assert first.success is False
+        assert first.error == "Post-only rejected"
+        assert second is not None
+        assert second.success is False
+        assert second.error == "duplicate_signal_suppressed"
+        assert router.duplicate_signals_suppressed == 1
+        assert mock_client.place_post_only_gtd.call_count == 1
+
     def test_insufficient_collateral_blocks_order(self, router, mock_client, market_info):
         """Live orders should be rejected before placement when collateral is insufficient."""
         mock_client.get_best_bid_ask.side_effect = [
@@ -536,3 +636,105 @@ class TestOrderRouter:
 
         assert result is None
         mock_client.place_post_only_gtd.assert_not_called()
+
+    def test_assess_market_executability_rejects_books_with_wide_spreads(
+        self, mock_client, market_info
+    ):
+        router = _build_router(mock_client, max_spread=0.30)
+        mock_client.get_order_book.side_effect = [
+            {
+                "bids": [{"price": "0.05", "size": "2"}],
+                "asks": [{"price": "0.485", "size": "3"}],
+            },
+            {
+                "bids": [{"price": "0.05", "size": "2"}],
+                "asks": [{"price": "0.515", "size": "3"}],
+            },
+        ]
+
+        diagnostics = router.assess_market_executability(market_info)
+
+        assert diagnostics["executable"] is False
+        assert diagnostics["executable_sides"] == []
+        assert diagnostics["pathological"] is False
+        assert diagnostics["yes"]["reason"] == "spread_too_wide"
+        assert diagnostics["no"]["reason"] == "spread_too_wide"
+        assert diagnostics["yes"]["spread"] == pytest.approx(0.435)
+        assert diagnostics["no"]["spread"] == pytest.approx(0.465)
+
+    def test_assess_market_executability_marks_dead_books_as_pathological(
+        self, mock_client, market_info
+    ):
+        router = _build_router(mock_client, max_spread=0.30)
+        mock_client.get_order_book.side_effect = [
+            {
+                "bids": [{"price": "0.05", "size": "2"}],
+                "asks": [{"price": "0.95", "size": "3"}],
+            },
+            {
+                "bids": [],
+                "asks": [{"price": "0.95", "size": "3"}],
+            },
+        ]
+
+        diagnostics = router.assess_market_executability(market_info)
+
+        assert diagnostics["executable"] is False
+        assert diagnostics["pathological"] is True
+        assert diagnostics["pathological_sides"] == ["YES", "NO"]
+        assert diagnostics["yes"]["pathological"] is True
+        assert diagnostics["yes"]["pathology_reason"] == "price_rails"
+        assert diagnostics["no"]["pathological"] is True
+        assert diagnostics["no"]["pathology_reason"] == "missing_quotes"
+
+    def test_assess_market_executability_accepts_market_when_one_side_is_tradeable(
+        self, mock_client, market_info
+    ):
+        router = _build_router(mock_client, max_spread=0.30)
+        mock_client.get_order_book.side_effect = [
+            {
+                "bids": [{"price": "0.40", "size": "5"}],
+                "asks": [{"price": "0.48", "size": "5"}],
+            },
+            {
+                "bids": [{"price": "0.05", "size": "2"}],
+                "asks": [{"price": "0.55", "size": "3"}],
+            },
+        ]
+
+        diagnostics = router.assess_market_executability(market_info)
+
+        assert diagnostics["executable"] is True
+        assert diagnostics["executable_sides"] == ["YES"]
+        assert diagnostics["yes"]["entry_viable"] is True
+        assert diagnostics["no"]["entry_viable"] is False
+        assert diagnostics["pathological"] is False
+
+    def test_assess_market_executability_rejects_side_above_max_entry_price(
+        self, mock_client, market_info
+    ):
+        router = _build_router(
+            mock_client,
+            max_spread=0.30,
+            max_entry_price=0.90,
+        )
+        mock_client.get_order_book.side_effect = [
+            {
+                "bids": [{"price": "0.98", "size": "5"}],
+                "asks": [{"price": "0.99", "size": "5"}],
+            },
+            {
+                "bids": [{"price": "0.25", "size": "5"}],
+                "asks": [{"price": "0.45", "size": "5"}],
+            },
+        ]
+
+        diagnostics = router.assess_market_executability(market_info)
+
+        assert diagnostics["executable"] is True
+        assert diagnostics["executable_sides"] == ["NO"]
+        assert diagnostics["yes"]["entry_viable"] is False
+        assert diagnostics["yes"]["reason"] == "price_too_high"
+        assert diagnostics["yes"]["price_ok"] is False
+        assert diagnostics["best_executable_side"] == "NO"
+        assert diagnostics["best_executable_price"] == pytest.approx(0.45)

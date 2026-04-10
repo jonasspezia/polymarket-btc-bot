@@ -104,15 +104,21 @@ python -m src.execution.engine
 ### 4a. Start With a $1 Budget
 
 If you want the bot to target a strict `$1` spend per order, use the
-dollar-based sizing path instead of raw shares:
+dollar-based sizing path instead of raw shares.
+
+Para produção, o runtime agora falha fechado se a configuração ficar mais
+agressiva do que os limites de governança. Em live, mantenha no máximo 25% do
+colateral disponível por ordem e preserve um piso mínimo de caixa.
 
 ```bash
 export DRY_RUN=false
 export LIVE_TRADING_ENABLED=true
 export ORDER_NOTIONAL=1.0
 export MAX_ORDER_NOTIONAL=1.0
-export BANKROLL_FRACTION_PER_ORDER=1.0
+export BANKROLL_FRACTION_PER_ORDER=0.25
 export ALLOW_UPSIZE_TO_MIN_ORDER_SIZE=false
+export MIN_AVAILABLE_COLLATERAL=10
+export MAX_AVAILABLE_COLLATERAL_DRAWDOWN=1
 ```
 
 Polymarket venue minimums still apply. If a live market needs more than `$1`
@@ -160,9 +166,33 @@ journalctl -u polymarket_bot -f
 
 - **Volatility Kill-Switch**: Cancels all orders on 3σ vol breach
 - **P&L Floor**: Halts trading at -$0.20 cumulative loss
-- **Position Limits**: Max 3 concurrent resting orders
+- **Available Collateral Floor**: Halts live trading if spendable collateral drops below `$10`
+- **Collateral Drawdown Breaker**: Halts live trading if session collateral drawdown exceeds `$1`
+- **Position Limits**: Max 1 concurrent resting order in live mode
+- **Entry Guardrails**: Live mode requires `MIN_EDGE >= 0.03`, `MIN_SIDE_PROBABILITY >= 0.55`, `MAX_ENTRY_PRICE <= 0.70`, `MAX_SPREAD <= 0.20`
+- **Expiry Guardrail**: Live entries require at least 60 seconds remaining; default runtime uses 120 seconds
 - **Post-Only Enforcement**: All orders are maker-only (zero fees)
 - **GTD Expiration**: Orders expire after 10 seconds
+
+## Production Discipline
+
+Sempre que houver mudança operacional relevante:
+
+1. Rode a suíte local antes de publicar.
+2. Atualize a documentação com os thresholds e impactos reais.
+3. Faça push do código para `main`.
+4. Acompanhe GitHub CI/CD até terminar sem falhas.
+5. Verifique os logs do container em produção após o rollout.
+6. Observe o serviço por alguns ciclos antes de considerar o deploy concluído.
+
+Checklist mínimo de live:
+
+```bash
+pytest -q
+git push origin main
+gh run watch --exit-status
+docker service logs -f polymarket-btc-bot-ishant5436_polymarket-btc-bot
+```
 
 ## Fee Model
 

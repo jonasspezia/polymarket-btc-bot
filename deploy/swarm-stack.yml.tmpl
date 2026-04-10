@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  polymarket-btc-bot:
+    image: __IMAGE_REF__
+    environment:
+      BOT_MODE: "__BOT_MODE__"
+      MODEL_TARGET_PATH: /app/data/models/lgbm_btc_5m.txt
+      ARTIFACTS_DIR: /app/data/artifacts
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_JSON: ${LOG_JSON:-true}
+      PYTHONUNBUFFERED: "1"
+__SECRETS_ENV__
+__SECRETS_SERVICE__
+    volumes:
+      - type: bind
+        source: __APP_ROOT__/.env
+        target: /app/.env
+        read_only: true
+      - type: bind
+        source: __APP_ROOT__/data/models
+        target: /app/data/models
+        read_only: true
+      - type: bind
+        source: __APP_ROOT__/data/raw
+        target: /app/data/raw
+      - type: bind
+        source: __APP_ROOT__/data/processed
+        target: /app/data/processed
+      - type: bind
+        source: __APP_ROOT__/data/artifacts
+        target: /app/data/artifacts
+      - type: bind
+        source: __APP_ROOT__/logs
+        target: /app/logs
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 3G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+      placement:
+        constraints:
+          - node.role == manager
+    stop_grace_period: 60s
+
+__SECRETS_TOPLEVEL__

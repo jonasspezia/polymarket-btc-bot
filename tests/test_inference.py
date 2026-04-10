@@ -10,6 +10,13 @@ import pytest
 from src.execution.inference import ModelInference
 
 
+if not hasattr(lgb, "Dataset") or not hasattr(lgb, "train"):
+    pytest.skip(
+        "LightGBM training backend indisponível neste ambiente de teste",
+        allow_module_level=True,
+    )
+
+
 @pytest.fixture
 def dummy_model_path(tmp_path):
     """Create a temporary dummy LightGBM model for testing."""

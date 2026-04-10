@@ -34,8 +34,9 @@ def validate_runtime_configuration(
 ) -> None:
     """Fail closed on runtime settings that are unsafe or incoherent."""
     errors: list[str] = []
+    live_mode = not dry_run and not validation_only
 
-    if not dry_run and not validation_only and not TRADING.live_trading_enabled:
+    if live_mode and not TRADING.live_trading_enabled:
         errors.append("LIVE_TRADING_ENABLED must be true for live mode")
 
     if TRADING.min_edge < 0:
@@ -79,6 +80,58 @@ def validate_runtime_configuration(
         errors.append("PRIVATE_CHECK_CACHE_TTL_SECONDS must be non-negative")
     if RISK.pnl_floor > 0:
         errors.append("PNL_FLOOR must be zero or negative")
+
+    if live_mode:
+        max_spread = float(getattr(TRADING, "max_spread", 0.30))
+        min_time_remaining_seconds = int(
+            getattr(TRADING, "min_time_remaining_seconds", 60)
+        )
+        time_decay_exit_seconds = int(
+            getattr(TRADING, "time_decay_exit_seconds", 1800)
+        )
+        min_available_collateral = float(
+            getattr(RISK, "min_available_collateral", 0.0)
+        )
+        max_available_collateral_drawdown = float(
+            getattr(RISK, "max_available_collateral_drawdown", 0.0)
+        )
+
+        if TRADING.min_edge < 0.03:
+            errors.append("MIN_EDGE must be at least 0.03 in live mode")
+        if TRADING.min_side_probability < 0.55:
+            errors.append(
+                "MIN_SIDE_PROBABILITY must be at least 0.55 in live mode"
+            )
+        if TRADING.max_entry_price > 0.70:
+            errors.append("MAX_ENTRY_PRICE must be at most 0.70 in live mode")
+        if max_spread > 0.20:
+            errors.append("MAX_SPREAD must be at most 0.20 in live mode")
+        if TRADING.max_open_positions > 1:
+            errors.append("MAX_OPEN_POSITIONS must be 1 in live mode")
+        if TRADING.bankroll_fraction_per_order > 0.25:
+            errors.append(
+                "BANKROLL_FRACTION_PER_ORDER must be at most 0.25 in live mode"
+            )
+        if min_time_remaining_seconds < 60:
+            errors.append(
+                "MIN_TIME_REMAINING_SECONDS must be at least 60 in live mode"
+            )
+        if time_decay_exit_seconds > 300:
+            errors.append(
+                "TIME_DECAY_EXIT_SECONDS must be at most 300 in live mode"
+            )
+        if min_available_collateral < 10:
+            errors.append(
+                "MIN_AVAILABLE_COLLATERAL must be at least 10 in live mode"
+            )
+        if max_available_collateral_drawdown <= 0:
+            errors.append(
+                "MAX_AVAILABLE_COLLATERAL_DRAWDOWN must be positive in live mode"
+            )
+        elif max_available_collateral_drawdown > 5:
+            errors.append(
+                "MAX_AVAILABLE_COLLATERAL_DRAWDOWN must be at most 5 in live mode"
+            )
 
     if errors:
         raise RuntimeConfigurationError("; ".join(errors))

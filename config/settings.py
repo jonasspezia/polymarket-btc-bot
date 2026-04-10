@@ -58,6 +58,17 @@ class PolymarketConfig:
 
     # Market discovery
     market_poll_interval_seconds: int = 240  # Refresh every 4 min (before 5-min resolution)
+    market_poll_retry_seconds: int = field(
+        default_factory=lambda: int(os.getenv("MARKET_POLL_RETRY_SECONDS", "5"))
+    )
+    market_rejection_backoff_seconds: int = field(
+        default_factory=lambda: int(os.getenv("MARKET_REJECTION_BACKOFF_SECONDS", "15"))
+    )
+    market_pathological_backoff_seconds: int = field(
+        default_factory=lambda: int(
+            os.getenv("MARKET_PATHOLOGICAL_BACKOFF_SECONDS", "60")
+        )
+    )
     btc_market_keywords: tuple = ("btc", "bitcoin", "5 min", "5-min", "5min")
 
 
@@ -120,13 +131,16 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("ORDER_NOTIONAL", "0.0"))
     )
     min_edge: float = field(
-        default_factory=lambda: float(os.getenv("MIN_EDGE", "0.02"))
+        default_factory=lambda: float(os.getenv("MIN_EDGE", "0.04"))
     )
     min_side_probability: float = field(
-        default_factory=lambda: float(os.getenv("MIN_SIDE_PROBABILITY", "0.52"))
+        default_factory=lambda: float(os.getenv("MIN_SIDE_PROBABILITY", "0.56"))
     )
     max_entry_price: float = field(
-        default_factory=lambda: float(os.getenv("MAX_ENTRY_PRICE", "0.90"))
+        default_factory=lambda: float(os.getenv("MAX_ENTRY_PRICE", "0.68"))
+    )
+    max_spread: float = field(
+        default_factory=lambda: float(os.getenv("MAX_SPREAD", "0.12"))
     )
     strategy_style: str = field(
         default_factory=lambda: os.getenv("STRATEGY_STYLE", "momentum").strip().lower()
@@ -157,7 +171,7 @@ class TradingConfig:
     )
     post_only: bool = True  # MANDATORY — never change this
     max_open_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+        default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "1"))
     )
     duplicate_signal_window_seconds: int = field(
         default_factory=lambda: int(os.getenv("DUPLICATE_SIGNAL_WINDOW_SECONDS", "15"))
@@ -193,7 +207,7 @@ class TradingConfig:
     )
     bankroll_fraction_per_order: float = field(
         default_factory=lambda: float(
-            os.getenv("BANKROLL_FRACTION_PER_ORDER", "1.0")
+            os.getenv("BANKROLL_FRACTION_PER_ORDER", "0.25")
         )
     )
     max_order_notional: float = field(
@@ -217,12 +231,23 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("TAKE_PROFIT_FRACTION", "0.5"))
     )
     time_decay_exit_seconds: int = field(
-        default_factory=lambda: int(os.getenv("TIME_DECAY_EXIT_SECONDS", "1800"))
+        default_factory=lambda: int(os.getenv("TIME_DECAY_EXIT_SECONDS", "180"))
     )
     time_decay_distance_pct: float = field(
         default_factory=lambda: float(
             os.getenv("TIME_DECAY_DISTANCE_PCT", "0.005")
         )
+    )
+    min_time_remaining_seconds: int = field(
+        default_factory=lambda: int(
+            os.getenv("MIN_TIME_REMAINING_SECONDS", "120")
+        )
+    )
+    use_kelly_sizing: bool = field(
+        default_factory=lambda: _get_bool_env("USE_KELLY_SIZING", False)
+    )
+    kelly_fraction: float = field(
+        default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.10"))
     )
     tick_size: str = "0.01"  # Polymarket tick size
 
@@ -248,6 +273,16 @@ class RiskConfig:
     )
     pnl_floor: float = field(
         default_factory=lambda: float(os.getenv("PNL_FLOOR", "-0.20"))
+    )
+    min_available_collateral: float = field(
+        default_factory=lambda: float(
+            os.getenv("MIN_AVAILABLE_COLLATERAL", "10.0")
+        )
+    )
+    max_available_collateral_drawdown: float = field(
+        default_factory=lambda: float(
+            os.getenv("MAX_AVAILABLE_COLLATERAL_DRAWDOWN", "1.0")
+        )
     )
     private_check_cache_ttl_seconds: float = field(
         default_factory=lambda: float(

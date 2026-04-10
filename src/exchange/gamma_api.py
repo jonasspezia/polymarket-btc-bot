@@ -108,16 +108,75 @@ class GammaAPIClient:
                 return self._cached_market
             return None
 
+    def get_active_btc_5m_market_candidates(
+        self,
+        force_refresh: bool = False,
+        limit: int = 10,
+    ) -> list[MarketInfo]:
+        """
+        Return ordered BTC market candidates for discovery-time selection.
+
+        Candidates are sorted by nearest relevant window first so callers can
+        iterate until they find the first executable market.
+        """
+        if limit <= 0:
+            return []
+
+        if (
+            not force_refresh
+            and self._cached_market is not None
+            and not self._cached_market.is_stale()
+        ):
+            return [self._cached_market]
+
+        try:
+            if POLYMARKET.event_slug:
+                candidates = self._fetch_markets_from_event_slug(
+                    POLYMARKET.event_slug,
+                    limit=limit,
+                )
+            else:
+                candidates = self._fetch_btc_5m_market_candidates(limit=limit)
+
+            if candidates:
+                self._cached_market = candidates[0]
+            return candidates[:limit]
+
+        except Exception as e:
+            logger.error("Gamma API candidate fetch error: %s", e)
+            if self._cached_market is not None:
+                logger.warning("Returning stale cached candidate market data")
+                return [self._cached_market]
+            return []
+
     def _fetch_market_from_event_slug(
         self,
         event_slug: str,
         market_interval_minutes: Optional[int] = None,
     ) -> Optional[MarketInfo]:
-        """Fetch a specific live market from a Polymarket event page."""
+        """Fetch the best-ranked live market from a Polymarket event page."""
+        markets = self._fetch_markets_from_event_slug(
+            event_slug,
+            market_interval_minutes=market_interval_minutes,
+            limit=1,
+        )
+        return markets[0] if markets else None
+
+    def _fetch_markets_from_event_slug(
+        self,
+        event_slug: str,
+        market_interval_minutes: Optional[int] = None,
+        limit: int = 1,
+    ) -> list[MarketInfo]:
+        """Fetch one or more ranked live markets from a Polymarket event page."""
+        if limit <= 0:
+            return []
+
         if self._is_event_page_fetch_backed_off(event_slug):
-            return self._fetch_market_from_event_api_fallback(
+            return self._fetch_markets_from_event_api_fallback(
                 event_slug,
                 market_interval_minutes=market_interval_minutes,
+                limit=limit,
             )
 
         url = f"{POLYMARKET.event_base}/{event_slug}"
@@ -131,9 +190,10 @@ class GammaAPIClient:
                 e,
             )
             self._back_off_event_page_fetch(event_slug)
-            return self._fetch_market_from_event_api_fallback(
+            return self._fetch_markets_from_event_api_fallback(
                 event_slug,
                 market_interval_minutes=market_interval_minutes,
+                limit=limit,
             )
 
         page_data = self._extract_next_data(resp.text)
@@ -143,31 +203,40 @@ class GammaAPIClient:
                 event_slug,
             )
             self._back_off_event_page_fetch(event_slug)
-            return self._fetch_market_from_event_api_fallback(
+            return self._fetch_markets_from_event_api_fallback(
                 event_slug,
                 market_interval_minutes=market_interval_minutes,
+                limit=limit,
             )
 
         event_payload = self._extract_event_payload(page_data, event_slug)
         if event_payload is not None:
-            event_market = self._select_market_from_event_payload(event_payload)
-            if event_market is not None:
+            event_markets = self._select_markets_from_event_payload(
+                event_payload,
+                limit=limit,
+            )
+            if event_markets:
                 self._clear_event_page_backoff(event_slug)
-                return self._parse_market(
-                    event_market,
-                    market_interval_minutes=market_interval_minutes,
-                )
+                return [
+                    self._parse_market(
+                        event_market,
+                        market_interval_minutes=market_interval_minutes,
+                    )
+                    for event_market in event_markets
+                ]
 
         market = self._find_market_by_slug(page_data, event_slug)
         if market is None:
             logger.warning("No market payload found in event page for slug=%s", event_slug)
-            return None
+            return []
 
         self._clear_event_page_backoff(event_slug)
-        return self._parse_market(
-            market,
-            market_interval_minutes=market_interval_minutes,
-        )
+        return [
+            self._parse_market(
+                market,
+                market_interval_minutes=market_interval_minutes,
+            )
+        ]
 
     def _fetch_market_from_event_api_fallback(
         self,
@@ -175,18 +244,41 @@ class GammaAPIClient:
         market_interval_minutes: Optional[int] = None,
     ) -> Optional[MarketInfo]:
         """Fetch event metadata from Gamma API and parse the best child market."""
+        markets = self._fetch_markets_from_event_api_fallback(
+            event_slug,
+            market_interval_minutes=market_interval_minutes,
+            limit=1,
+        )
+        return markets[0] if markets else None
+
+    def _fetch_markets_from_event_api_fallback(
+        self,
+        event_slug: str,
+        market_interval_minutes: Optional[int] = None,
+        limit: int = 1,
+    ) -> list[MarketInfo]:
+        """Fetch event metadata from Gamma API and parse ranked child markets."""
+        if limit <= 0:
+            return []
+
         event_payload = self._fetch_event_by_slug_api(event_slug)
         if not event_payload:
-            return None
+            return []
 
-        event_market = self._select_market_from_event_payload(event_payload)
-        if event_market is None:
-            return None
-
-        return self._parse_market(
-            event_market,
-            market_interval_minutes=market_interval_minutes,
+        event_markets = self._select_markets_from_event_payload(
+            event_payload,
+            limit=limit,
         )
+        if not event_markets:
+            return []
+
+        return [
+            self._parse_market(
+                event_market,
+                market_interval_minutes=market_interval_minutes,
+            )
+            for event_market in event_markets
+        ]
 
     def _fetch_btc_5m_market(self) -> Optional[MarketInfo]:
         """
@@ -197,10 +289,31 @@ class GammaAPIClient:
         2. Legacy BTC 5-minute contract, if it exists in Gamma listings.
         3. Active BTC hourly recurring event, selecting the strike closest to 50/50.
         """
-        market = self._fetch_btc_updown_5m_market()
-        if market is not None:
-            return market
+        direct_market = self._fetch_btc_updown_5m_market()
+        if direct_market is not None:
+            return direct_market
 
+        candidates = self._fetch_btc_5m_market_candidates(limit=1)
+        return candidates[0] if candidates else None
+
+    def _fetch_btc_5m_market_candidates(self, limit: int = 10) -> list[MarketInfo]:
+        """Return ordered BTC candidates across compatible short-term families."""
+        combined_candidates: list[MarketInfo] = []
+        combined_candidates.extend(self._fetch_btc_updown_5m_market_candidates())
+        combined_candidates.extend(
+            self._fetch_listed_btc_5m_market_candidates(limit=max(limit, 5))
+        )
+        combined_candidates.extend(
+            self._fetch_btc_hourly_market_candidates(limit=max(min(limit, 6), 2))
+        )
+
+        return self._dedupe_market_candidates(combined_candidates)[:limit]
+
+    def _fetch_listed_btc_5m_market_candidates(
+        self,
+        limit: int = 5,
+    ) -> list[MarketInfo]:
+        """Return BTC 5-minute candidates surfaced by generic Gamma listings."""
         # Strategy 1: Search by tag/keyword
         markets = self._search_markets("btc 5 min")
         if not markets:
@@ -212,24 +325,26 @@ class GammaAPIClient:
             markets = self._filter_btc_5m(markets)
 
         if markets:
-            # Pick the market that is active and closest to resolution
-            # (i.e., the one currently tradeable, not a future one)
-            best = None
-            for m in markets:
-                if m.get("active", False) and not m.get("closed", True):
-                    if best is None:
-                        best = m
-                    else:
-                        # Prefer the one with the earliest end_date (soonest resolution)
-                        if m.get("end_date_iso", "") < best.get("end_date_iso", ""):
-                            best = m
+            active_markets = [
+                market
+                for market in markets
+                if market.get("active", False) and not market.get("closed", True)
+            ]
+            if not active_markets:
+                active_markets = list(markets)
 
-            if best is None:
-                best = markets[0]  # Fallback
+            active_markets.sort(
+                key=lambda market: (
+                    market.get("end_date_iso", market.get("endDate", market.get("end_date", ""))),
+                    str(market.get("slug", "")),
+                )
+            )
+            return [
+                self._parse_market(market, market_interval_minutes=5)
+                for market in active_markets[:limit]
+            ]
 
-            return self._parse_market(best, market_interval_minutes=5)
-
-        return self._fetch_btc_hourly_market()
+        return []
 
     def _fetch_btc_updown_5m_market(
         self,
@@ -248,6 +363,14 @@ class GammaAPIClient:
         window plus its immediate neighbors and choose the market whose 5-minute
         window best matches the current time.
         """
+        candidates = self._fetch_btc_updown_5m_market_candidates(now_ts=now_ts)
+        return candidates[0] if candidates else None
+
+    def _fetch_btc_updown_5m_market_candidates(
+        self,
+        now_ts: Optional[float] = None,
+    ) -> list[MarketInfo]:
+        """Return ordered candidates from the recurring BTC up/down 5-minute family."""
         now_ts = time.time() if now_ts is None else now_ts
         candidates: list[tuple[float, float, MarketInfo]] = []
 
@@ -268,22 +391,41 @@ class GammaAPIClient:
             candidates.append((start_ts, end_ts, market))
 
         if not candidates:
-            return None
+            return []
 
         in_window = [
             item for item in candidates if item[0] <= now_ts < item[1]
         ]
-        if in_window:
-            in_window.sort(key=lambda item: (abs(item[0] - now_ts), item[1]))
-            return in_window[0][2]
+        future = [item for item in candidates if item[1] > now_ts and item not in in_window]
+        past = [item for item in candidates if item[1] <= now_ts]
 
-        future = [item for item in candidates if item[1] > now_ts]
-        if future:
-            future.sort(key=lambda item: (item[0], item[1]))
-            return future[0][2]
+        in_window.sort(key=lambda item: (abs(item[0] - now_ts), item[1]))
+        future.sort(key=lambda item: (item[0], item[1]))
+        past.sort(key=lambda item: item[1], reverse=True)
 
-        candidates.sort(key=lambda item: item[1], reverse=True)
-        return candidates[0][2]
+        ordered_markets: list[MarketInfo] = []
+        seen_keys: set[str] = set()
+        for _start_ts, _end_ts, market in [*in_window, *future, *past]:
+            key = market.condition_id or market.slug
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ordered_markets.append(market)
+
+        return ordered_markets
+
+    @staticmethod
+    def _dedupe_market_candidates(candidates: list[MarketInfo]) -> list[MarketInfo]:
+        """Preserve order while removing duplicate candidate markets."""
+        ordered_markets: list[MarketInfo] = []
+        seen_keys: set[str] = set()
+        for market in candidates:
+            key = market.condition_id or market.slug
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ordered_markets.append(market)
+        return ordered_markets
 
     def _candidate_btc_updown_5m_start_times(self, now_ts: float) -> list[int]:
         """Return nearby 5-minute window starts for the recurring up/down family."""
@@ -461,34 +603,66 @@ class GammaAPIClient:
         the active event nearest expiry and then the child market nearest a
         50/50 yes-price so it best approximates an up/down-style binary.
         """
+        candidates = self._fetch_btc_hourly_market_candidates(limit=1)
+        return candidates[0] if candidates else None
+
+    def _fetch_btc_hourly_market_candidates(
+        self,
+        limit: int = 4,
+    ) -> list[MarketInfo]:
+        """Return ranked candidates from the live BTC hourly family."""
+        if limit <= 0:
+            return []
+
         series_list = self._get_active_series()
         if not series_list:
-            return None
+            return []
 
         hourly_series = [
             series for series in series_list if self._is_bitcoin_hourly_series(series)
         ]
         if not hourly_series:
-            return None
+            return []
 
         preferred = next(
-            (series for series in hourly_series if series.get("slug") == "bitcoin-multi-strikes-hourly"),
+            (
+                series
+                for series in hourly_series
+                if series.get("slug") == "bitcoin-multi-strikes-hourly"
+            ),
             hourly_series[0],
         )
-        event = self._select_best_series_event(preferred.get("events", []))
-        if event is None:
-            logger.warning("No active BTC hourly event found in series=%s", preferred.get("slug"))
-            return None
+        events = self._select_best_series_events(
+            preferred.get("events", []),
+            limit=2,
+        )
+        if not events:
+            logger.warning(
+                "No active BTC hourly event found in series=%s",
+                preferred.get("slug"),
+            )
+            return []
 
-        logger.info(
-            "Falling back to BTC hourly series | event_slug=%s end=%s",
-            event.get("slug"),
-            event.get("endDate"),
-        )
-        return self._fetch_market_from_event_slug(
-            event["slug"],
-            market_interval_minutes=60,
-        )
+        per_event_limit = max(1, min(3, limit))
+        candidates: list[MarketInfo] = []
+        for event in events:
+            logger.info(
+                "Fetched BTC hourly candidate family | event_slug=%s end=%s limit=%d",
+                event.get("slug"),
+                event.get("endDate"),
+                per_event_limit,
+            )
+            candidates.extend(
+                self._fetch_markets_from_event_slug(
+                    event["slug"],
+                    market_interval_minutes=60,
+                    limit=per_event_limit,
+                )
+            )
+            if len(candidates) >= limit:
+                break
+
+        return self._dedupe_market_candidates(candidates)[:limit]
 
     def _fetch_event_by_slug_api(self, event_slug: str) -> Optional[dict]:
         """Fetch event metadata directly from the Gamma API by slug."""
@@ -647,28 +821,81 @@ class GammaAPIClient:
                 continue
             candidates.append((end_ts, event))
 
+        selected_events = cls._select_best_series_events(
+            events,
+            now_ts=now_ts,
+            limit=1,
+        )
+        return selected_events[0] if selected_events else None
+
+    @classmethod
+    def _select_best_series_events(
+        cls,
+        events: list[dict],
+        now_ts: Optional[float] = None,
+        limit: int = 1,
+    ) -> list[dict]:
+        """Return active series events ordered by nearest relevant expiry."""
+        if limit <= 0:
+            return []
+
+        now_ts = time.time() if now_ts is None else now_ts
+        candidates: list[tuple[float, dict]] = []
+
+        for event in events:
+            if not event.get("active", False) or event.get("closed", True):
+                continue
+
+            end_ts = cls._parse_iso_timestamp(event.get("endDate"))
+            if end_ts is None:
+                continue
+            candidates.append((end_ts, event))
+
         if not candidates:
-            return None
+            return []
 
         future = [item for item in candidates if item[0] >= now_ts]
         if future:
             future.sort(key=lambda item: item[0])
-            return future[0][1]
+            return [event for _, event in future[:limit]]
 
         candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates[0][1]
+        return [event for _, event in candidates[:limit]]
 
     @classmethod
     def _select_market_from_event_payload(cls, event_payload: dict) -> Optional[dict]:
         """
         Select the child market from an event payload that best matches an
-        up/down-style binary by choosing the most balanced active strike.
+        up/down-style binary while preferring the tightest healthy book first.
         """
+        markets = cls._select_markets_from_event_payload(event_payload, limit=1)
+        return markets[0] if markets else None
+
+    @classmethod
+    def _select_markets_from_event_payload(
+        cls,
+        event_payload: dict,
+        limit: int = 1,
+    ) -> list[dict]:
+        """
+        Select one or more ranked child markets from an event payload.
+
+        The ranking prioritizes:
+        1. Healthy books over pathological children.
+        2. Tighter spreads.
+        3. Prices closer to the middle band, which preserves entry headroom.
+        4. Higher liquidity as a final tie-breaker.
+        """
+        if limit <= 0:
+            return []
+
         markets = event_payload.get("markets", [])
         if not isinstance(markets, list) or not markets:
-            return None
+            return []
 
-        scored_markets: list[tuple[float, float, str, dict]] = []
+        scored_markets: list[tuple[float, float, float, str, dict]] = []
+        healthy_scored_markets: list[tuple[float, float, float, str, dict]] = []
+        centered_healthy_scored_markets: list[tuple[float, float, float, str, dict]] = []
         for market in markets:
             if not market.get("active", False) or market.get("closed", True):
                 continue
@@ -677,23 +904,50 @@ class GammaAPIClient:
             if yes_price is None:
                 continue
 
+            quote_health = cls._event_market_quote_health(market)
             liquidity = cls._coerce_float(
                 market.get("liquidityClob", market.get("liquidityNum", market.get("liquidity", 0)))
             )
-            scored_markets.append(
-                (
-                    abs(yes_price - 0.5),
-                    -liquidity,
-                    str(market.get("slug", "")),
-                    market,
-                )
+            score = (
+                quote_health["spread"],
+                abs(yes_price - 0.5),
+                -liquidity,
+                str(market.get("slug", "")),
+                market,
             )
+            scored_markets.append(score)
+            if not quote_health["pathological"]:
+                healthy_scored_markets.append(score)
+                if 0.15 <= yes_price <= 0.85:
+                    centered_healthy_scored_markets.append(score)
 
-        if not scored_markets:
-            return None
+        selection_pool = (
+            centered_healthy_scored_markets
+            or healthy_scored_markets
+            or scored_markets
+        )
+        if not selection_pool:
+            return []
 
-        scored_markets.sort(key=lambda item: item[:3])
-        return scored_markets[0][3]
+        selection_pool.sort(key=lambda item: item[:4])
+        return [item[4] for item in selection_pool[:limit]]
+
+    @classmethod
+    def _event_market_quote_health(cls, market: dict) -> dict[str, float | bool]:
+        """Classify child-market quote quality before selecting a series strike."""
+        best_bid = cls._coerce_float(market.get("bestBid"))
+        best_ask = cls._coerce_float(market.get("bestAsk"))
+        has_quotes = best_bid > 0 and best_ask > 0
+        spread = (best_ask - best_bid) if has_quotes else float("inf")
+        at_price_rails = has_quotes and best_bid <= 0.05 and best_ask >= 0.95
+        extreme_spread = has_quotes and spread >= 0.80
+
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "pathological": (not has_quotes) or at_price_rails or extreme_spread,
+        }
 
     @classmethod
     def _extract_yes_price(cls, market: dict) -> Optional[float]:

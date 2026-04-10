@@ -72,6 +72,8 @@ def risk_manager(state, mock_client):
         pnl_floor=-0.20,
         max_positions=3,
         private_check_cache_ttl_seconds=60.0,
+        min_available_collateral=10.0,
+        max_available_collateral_drawdown=1.0,
     )
 
 
@@ -131,6 +133,32 @@ class TestRiskManager:
             available_to_trade=0.0,
         )
         assert not risk_manager.check_balance()
+
+    def test_check_balance_halts_when_available_collateral_drops_below_floor(
+        self, risk_manager, mock_client
+    ):
+        mock_client.get_collateral_balance_allowance.side_effect = [
+            SimpleNamespace(balance=10.5, allowance=10.5, available_to_trade=10.5),
+            SimpleNamespace(balance=9.9, allowance=9.9, available_to_trade=9.9),
+        ]
+
+        assert risk_manager.check_balance()
+        risk_manager.invalidate_private_check_cache()
+        assert not risk_manager.check_balance()
+        assert risk_manager.is_halted
+
+    def test_check_balance_halts_on_session_drawdown(
+        self, risk_manager, mock_client
+    ):
+        mock_client.get_collateral_balance_allowance.side_effect = [
+            SimpleNamespace(balance=12.0, allowance=12.0, available_to_trade=12.0),
+            SimpleNamespace(balance=10.8, allowance=10.8, available_to_trade=10.8),
+        ]
+
+        assert risk_manager.check_balance()
+        risk_manager.invalidate_private_check_cache()
+        assert not risk_manager.check_balance()
+        assert risk_manager.is_halted
 
     def test_check_balance_blocks_when_collateral_status_is_unavailable(
         self, risk_manager, mock_client

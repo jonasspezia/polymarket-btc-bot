@@ -1,0 +1,181 @@
+{
+  "trained_at": "2026-04-10T14:18:24.974867+00:00",
+  "experiment_id": "exp-20260410T141743Z-2c9ec809",
+  "target_horizon_minutes": 5,
+  "feature_columns": [
+    "obi",
+    "momentum_2m",
+    "momentum_5m",
+    "momentum_10m",
+    "hurst",
+    "fracdiff_close",
+    "vol_1m",
+    "vol_5m",
+    "vol_30m",
+    "vol_60m",
+    "vwap_dev_5m",
+    "vwap_dev_30m",
+    "trade_flow_imb_5m",
+    "trade_flow_imb_30m",
+    "hl_range",
+    "vol_ratio_5m",
+    "vol_ratio_30m",
+    "trades_intensity",
+    "trend_alignment",
+    "pseudo_liq_imbalance_1m",
+    "pseudo_liq_imbalance_5m"
+  ],
+  "n_features": 21,
+  "fold_metrics": [
+    {
+      "fold": 1,
+      "train_size": 21445,
+      "val_size": 21445,
+      "auc": 0.5290219895608337,
+      "auc_std": 0.003221699383317462,
+      "log_loss": 0.6919732529234152,
+      "accuracy": 0.5228258335276288,
+      "brier_score": 0.24941550263898915,
+      "best_iteration": 11
+    },
+    {
+      "fold": 2,
+      "train_size": 42890,
+      "val_size": 21445,
+      "auc": 0.5307093276438761,
+      "auc_std": 0.0018851153852813404,
+      "log_loss": 0.6914670895003295,
+      "accuracy": 0.524970855677314,
+      "brier_score": 0.2491622912674736,
+      "best_iteration": 28
+    },
+    {
+      "fold": 3,
+      "train_size": 64335,
+      "val_size": 21445,
+      "auc": 0.5220721072159455,
+      "auc_std": 0.0026327249496869956,
+      "log_loss": 0.6927994280564322,
+      "accuracy": 0.5215201678712986,
+      "brier_score": 0.24982605036669364,
+      "best_iteration": 6
+    },
+    {
+      "fold": 4,
+      "train_size": 85780,
+      "val_size": 21445,
+      "auc": 0.5327608473680174,
+      "auc_std": 0.0011109076669143664,
+      "log_loss": 0.6914137739554507,
+      "accuracy": 0.5240848682676614,
+      "brier_score": 0.24913561840372703,
+      "best_iteration": 34
+    },
+    {
+      "fold": 5,
+      "train_size": 107225,
+      "val_size": 21439,
+      "auc": 0.5323167439646599,
+      "auc_std": 0.001537668675917171,
+      "log_loss": 0.6917223446928181,
+      "accuracy": 0.5217594104202622,
+      "brier_score": 0.24928983293042695,
+      "best_iteration": 25
+    }
+  ],
+  "cv_summary": {
+    "auc": {
+      "mean": 0.5293762031506666,
+      "std": 0.004340365836022144
+    },
+    "auc_std": {
+      "mean": 0.0020776232122234673,
+      "std": 0.0008485572070364678
+    },
+    "log_loss": {
+      "mean": 0.6918751778256891,
+      "std": 0.0005627265750548085
+    },
+    "accuracy": {
+      "mean": 0.5230322271528329,
+      "std": 0.0014845300524635933
+    },
+    "brier_score": {
+      "mean": 0.24936585912146209,
+      "std": 0.00028038861515054916
+    },
+    "best_iteration": {
+      "mean": 20.8,
+      "std": 11.819475453673906
+    }
+  },
+  "training_parameters": {
+    "n_splits": 5,
+    "purge_gap": 10,
+    "optuna_trials": 100,
+    "n_seeds": 5,
+    "target_horizon_minutes": 5
+  },
+  "best_hyperparameters": {
+    "num_leaves": 31,
+    "learning_rate": 0.05,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "min_data_in_leaf": 50,
+    "min_gain_to_split": 0.0,
+    "lambda_l1": 1e-05,
+    "lambda_l2": 1e-05,
+    "max_depth": 6,
+    "path_smooth": 0.0
+  },
+  "ensemble_info": {
+    "n_seeds": 5,
+    "seeds": [
+      42,
+      43,
+      44,
+      45,
+      46
+    ],
+    "final_iterations": 25,
+    "avg_cv_best_iteration": 20
+  },
+  "dataset_summary": {
+    "rows": 128674,
+    "columns": 26,
+    "column_names": [
+      "open_time",
+      "obi",
+      "momentum_1m",
+      "momentum_2m",
+      "momentum_5m",
+      "momentum_10m",
+      "hurst",
+      "fracdiff_close",
+      "vol_1m",
+      "vol_5m",
+      "vol_30m",
+      "vol_60m",
+      "vwap_dev_5m",
+      "vwap_dev_30m",
+      "trade_flow_imb",
+      "trade_flow_imb_5m",
+      "trade_flow_imb_30m",
+      "hl_range",
+      "vol_ratio_5m",
+      "vol_ratio_30m",
+      "trades_intensity",
+      "trend_alignment",
+      "pseudo_liq_imbalance_1m",
+      "pseudo_liq_imbalance_5m",
+      "target",
+      "future_return"
+    ],
+    "timestamp_start": "2026-01-11 05:42:00+00:00",
+    "timestamp_end": "2026-04-10 14:15:00+00:00",
+    "target_mean": 0.4967359373299967,
+    "target_horizon_minutes": 5
+  },
+  "model_file": "lgbm_btc_5m.txt"
+}
