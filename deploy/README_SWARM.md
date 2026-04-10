@@ -125,7 +125,7 @@ pytest -q
 git push origin main
 ```
 
-3. Acompanhar CI/CD:
+3. Acompanhar GitHub Actions:
 
 ```bash
 gh run watch --exit-status
@@ -148,6 +148,14 @@ docker service ps polymarket-btc-bot-ishant5436_polymarket-btc-bot --no-trunc
 Recomendação prática: depois do deploy, observar por alguns ciclos de discovery
 e pelo menos um relatório periódico de status antes de considerar o rollout
 encerrado.
+
+Hoje o workflow `CI` do repositório cobre:
+
+- `pytest -q`
+- `docker build -t polymarket-btc-bot-ci .`
+
+O rollout de produção segue manual no Swarm, porque o host precisa do modelo
+treinado e dos segredos fora do GitHub.
 
 ## Observações
 

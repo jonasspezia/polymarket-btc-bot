@@ -181,7 +181,7 @@ Sempre que houver mudança operacional relevante:
 1. Rode a suíte local antes de publicar.
 2. Atualize a documentação com os thresholds e impactos reais.
 3. Faça push do código para `main`.
-4. Acompanhe GitHub CI/CD até terminar sem falhas.
+4. Acompanhe o workflow `CI` no GitHub até terminar sem falhas.
 5. Verifique os logs do container em produção após o rollout.
 6. Observe o serviço por alguns ciclos antes de considerar o deploy concluído.
 
@@ -193,6 +193,14 @@ git push origin main
 gh run watch --exit-status
 docker service logs -f polymarket-btc-bot-ishant5436_polymarket-btc-bot
 ```
+
+O workflow `CI` agora valida duas coisas em todo push para `main`:
+
+- `pytest -q`
+- `docker build -t polymarket-btc-bot-ci .`
+
+O deploy em Swarm continua manual, porque depende do modelo treinado e dos
+segredos locais do host.
 
 ## Fee Model
 
